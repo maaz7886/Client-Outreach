@@ -1,0 +1,23 @@
+@import "tailwindcss";
+
+:root {
+  --brand-dark: #0f3622;
+  --brand-green: #1a5c38;
+  --brand-light: #2d7a50;
+  --brand-accent: #e8f5ee;
+  --background: #f8faf9;
+  --foreground: #0f1a14;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: 'Inter', 'Segoe UI', Arial, Helvetica, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Smooth focus rings */
+*:focus-visible {
+  outline: 2px solid #1a5c38;
+  outline-offset: 2px;
+}

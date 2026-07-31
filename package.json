@@ -1,0 +1,13 @@
+{
+  "name": "aivalytics-outreach",
+  "version": "1.0.0",
+  "description": "AIValytics College Outreach System — single dev command",
+  "private": true,
+  "scripts": {
+    "dev": "npm run dev:backend & npm run dev:frontend",
+    "dev:backend": "docker compose up -d db redis api worker beat",
+    "dev:frontend": "cd frontend && npm run dev",
+    "stop": "docker compose stop db redis api worker beat",
+    "logs": "docker compose logs -f api worker"
+  }
+}
