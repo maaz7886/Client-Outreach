@@ -1,12 +1,15 @@
 services:
   db:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_USER: outreach
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
       POSTGRES_DB: outreach
     volumes:
       - pgdata:/var/lib/postgresql/data
+    # db port is intentionally NOT published to host — only api/worker/beat
+    # can reach it via the internal Docker bridge network.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U outreach"]
       interval: 5s
@@ -15,6 +18,8 @@ services:
 
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
+    # redis port is intentionally NOT published to host.
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -24,12 +29,15 @@ services:
   api:
     build: ./backend
     command: ["api"]
+    restart: unless-stopped
     env_file: .env
     environment:
       DATABASE_URL: postgresql+psycopg://outreach:${POSTGRES_PASSWORD}@db:5432/outreach
       REDIS_URL: redis://redis:6379/0
     ports:
-      - "8000:8000"
+      # Bind to 127.0.0.1 only — cloudflared reaches it via localhost,
+      # but external machines cannot hit port 8000 directly.
+      - "127.0.0.1:8000:8000"
     depends_on:
       db:
         condition: service_healthy
@@ -39,6 +47,7 @@ services:
   worker:
     build: ./backend
     command: ["worker"]
+    restart: unless-stopped
     env_file: .env
     environment:
       DATABASE_URL: postgresql+psycopg://outreach:${POSTGRES_PASSWORD}@db:5432/outreach
@@ -52,6 +61,7 @@ services:
   beat:
     build: ./backend
     command: ["beat"]
+    restart: unless-stopped
     env_file: .env
     environment:
       DATABASE_URL: postgresql+psycopg://outreach:${POSTGRES_PASSWORD}@db:5432/outreach
@@ -59,13 +69,16 @@ services:
     depends_on:
       - worker
 
+  # The `web` service is kept for local development only.
+  # In production the frontend is deployed on Vercel — comment this out
+  # or use `docker compose up -d db redis api worker beat` to skip it.
   web:
     build:
       context: ./frontend
       args:
         NEXT_PUBLIC_API_URL: ${PUBLIC_API_URL:-http://localhost:8000}
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     depends_on:
       - api
 

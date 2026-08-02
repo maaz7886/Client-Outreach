@@ -1,0 +1,38 @@
+# Cloudflare Tunnel configuration
+# ================================================
+# 1. Replace TUNNEL_UUID with the UUID from:
+#      cloudflared tunnel create college-outreach
+#
+# 2. Replace YOUR_WINDOWS_USERNAME with your actual
+#    Windows user folder name (run: echo %USERPROFILE%)
+#
+# 3. Replace api.yourdomain.com with your subdomain.
+#
+# 4. Copy this file to:
+#    %USERPROFILE%\.cloudflared\config.yml
+#    (NOT the repo folder — it contains a path to your credentials)
+# ================================================
+
+tunnel: TUNNEL_UUID
+credentials-file: C:\Users\YOUR_WINDOWS_USERNAME\.cloudflared\TUNNEL_UUID.json
+
+# Expose Prometheus metrics on localhost for health checks
+metrics: localhost:2000
+
+ingress:
+  # ONLY the FastAPI API is routed through the tunnel.
+  # PostgreSQL (5432) and Redis (6379) have NO ingress rules here
+  # and are also not published in docker-compose — doubly private.
+  - hostname: api.yourdomain.com
+    service: http://localhost:8000
+    originRequest:
+      # Strip Cloudflare-injected headers that FastAPI doesn't need
+      noTLSVerify: false
+      connectTimeout: 10s
+      # Tell cloudflared to retry connecting to localhost if Docker
+      # hasn't finished starting yet (especially useful after reboot)
+      keepAliveConnections: 10
+
+  # Catch-all: return 404 for any other hostname.
+  # This is required by cloudflared — the last rule must always be a catch-all.
+  - service: http_status:404

@@ -300,6 +300,71 @@ docker compose stop
 
 ---
 
+## Production Deployment (Cloudflare Tunnel + Vercel)
+
+This setup keeps **all backend services running locally** and exposes only the
+FastAPI API via Cloudflare Tunnel. The Next.js frontend is deployed to Vercel.
+
+```
+Vercel (frontend)
+    ↓ HTTPS
+Cloudflare Edge  ←──────────────────── cloudflared (Windows service)
+                                              ↓
+                                    localhost:8000 (Docker api container)
+                                              ↓
+                            db / redis / worker / beat  (private Docker network)
+```
+
+### One-time setup (Administrator PowerShell)
+
+```powershell
+# 1. Run the automated setup script
+cd D:\college-outreach-system
+.\scripts\setup-cloudflare-tunnel.ps1 -TunnelName "college-outreach" -Hostname "api.yourdomain.com"
+
+# 2. Generate a strong JWT secret
+.\scripts\generate-jwt-secret.ps1
+
+# 3. Update .env with your real values
+#    PUBLIC_BASE_URL=https://api.yourdomain.com
+#    PUBLIC_API_URL=https://api.yourdomain.com
+#    CORS_ORIGINS=https://your-app.vercel.app,http://localhost:3000
+#    JWT_SECRET=<output from step 2>
+notepad .env
+
+# 4. Rebuild containers to pick up .env changes
+docker compose up -d --build db redis api worker beat
+
+# 5. Set NEXT_PUBLIC_API_URL in Vercel Dashboard
+#    → Your Project → Settings → Environment Variables
+#    → NEXT_PUBLIC_API_URL = https://api.yourdomain.com
+#    Then redeploy the frontend.
+
+# 6. Verify everything
+.\scripts\verify.ps1 -TunnelHostname "api.yourdomain.com" -VercelOrigin "https://your-app.vercel.app"
+```
+
+### After every reboot
+
+The Task Scheduler job and cloudflared Windows service start automatically.
+To start manually:
+
+```powershell
+.\scripts\start-backend.ps1
+```
+
+### Security boundaries
+
+| Service | Publicly accessible? | How |
+|---|---|---|
+| FastAPI API (8000) | ✅ Via tunnel only | Bound to `127.0.0.1:8000`, tunnel routes `api.yourdomain.com` |
+| PostgreSQL (5432) | ❌ Never | No `ports:` in docker-compose |
+| Redis (6379) | ❌ Never | No `ports:` in docker-compose |
+| Celery Worker | ❌ Never | No ports exposed |
+| Celery Beat | ❌ Never | No ports exposed |
+
+---
+
 ## Troubleshooting
 
 | Problem | Fix |
@@ -310,6 +375,9 @@ docker compose stop
 | LLM errors | Check your `LLM_API_KEY` in `.env` is valid at console.groq.com |
 | No drafts generated | Run steps in order: import → research → contacts → drafts |
 | Emails not sending | Fill in SMTP settings in `.env` and ensure SPF/DKIM DNS records are set |
+| CORS errors from Vercel | Check `CORS_ORIGINS` in `.env` contains your exact Vercel URL |
+| Tunnel offline (502) | `Restart-Service cloudflared` — check logs with `Get-EventLog -LogName Application -Source cloudflared -Newest 20` |
+| Tunnel never connects | Run `.\scripts\verify.ps1` — confirm `http://localhost:8000/health` works locally first |
 
 ---
 

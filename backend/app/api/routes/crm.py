@@ -110,6 +110,146 @@ def list_contacts(status: str | None = None, limit: int = 50, offset: int = 0,
     }
 
 
+# ---------- direct contact import
+# IMPORTANT: these POST routes must be registered BEFORE /contacts/{contact_id}
+# so FastAPI doesn't treat "import" as a path parameter and return 405. ----------
+
+class ContactImportRow(BaseModel):
+    college_name: str
+    city: str = "Unknown"
+    state: str = "Unknown"
+    website: str | None = None
+    # TPO
+    tpo_name: str | None = None
+    tpo_email: str | None = None
+    # Director / Principal
+    director_name: str | None = None
+    director_email: str | None = None
+
+
+class ContactImportRequest(BaseModel):
+    rows: list[ContactImportRow]
+
+
+def _normalize(name: str) -> str:
+    return re.sub(r"\s+", " ", name.strip().lower())
+
+
+def _upsert_college(db: Session, row: ContactImportRow) -> College:
+    norm = _normalize(row.college_name)
+    college = db.query(College).filter_by(normalized_name=norm, city=row.city).first()
+    if not college:
+        college = College(
+            name=row.college_name.strip(),
+            normalized_name=norm,
+            city=row.city.strip(),
+            state=row.state.strip(),
+            website=row.website or None,
+            college_type=CollegeType.UNKNOWN,
+            discovery_source="manual_import",
+        )
+        db.add(college)
+        db.flush()
+    return college
+
+
+def _upsert_contact(db: Session, college: College, name: str, email: str | None,
+                    role: CanonicalRole) -> tuple[Contact, bool]:
+    """Return (contact, created). Dedup on college_id + email if email given, else name."""
+    existing = None
+    if email:
+        existing = db.query(Contact).filter_by(
+            college_id=college.id, email=email.lower().strip()
+        ).first()
+    if not existing:
+        existing = db.query(Contact).filter_by(
+            college_id=college.id, full_name=name.strip()
+        ).first()
+    if existing:
+        return existing, False
+    contact = Contact(
+        college_id=college.id,
+        full_name=name.strip(),
+        email=email.lower().strip() if email else None,
+        role=role,
+        confidence=95,
+        status=ContactStatus.VERIFIED,
+    )
+    db.add(contact)
+    db.flush()
+    db.add(ContactSource(
+        contact_id=contact.id,
+        field_name="email",
+        source_type=SourceType.MANUAL,
+        source_url="manual_import",
+        excerpt="Directly imported by operator",
+        collected_at=datetime.now(timezone.utc),
+    ))
+    return contact, True
+
+
+@router.post("/contacts/import")
+def import_contacts(body: ContactImportRequest,
+                    user: User = Depends(require_operator),
+                    db: Session = Depends(get_db)):
+    """Bulk-import colleges + contacts (TPO + Director) in one call."""
+    added_colleges = 0
+    added_contacts = 0
+    skipped_contacts = 0
+
+    for row in body.rows:
+        if not row.college_name.strip():
+            continue
+        college = _upsert_college(db, row)
+        if college.id is None:
+            added_colleges += 1
+
+        for name, email, role in [
+            (row.tpo_name, row.tpo_email, CanonicalRole.TPO),
+            (row.director_name, row.director_email, CanonicalRole.DIRECTOR),
+        ]:
+            if not name:
+                continue
+            _, created = _upsert_contact(db, college, name, email, role)
+            if created:
+                added_contacts += 1
+            else:
+                skipped_contacts += 1
+
+    db.commit()
+    return {
+        "ok": True,
+        "colleges_processed": len(body.rows),
+        "contacts_added": added_contacts,
+        "contacts_skipped": skipped_contacts,
+        "message": f"Added {added_contacts} contacts across {len(body.rows)} colleges.",
+    }
+
+
+@router.post("/contacts/import-csv")
+def import_contacts_csv(body: dict,
+                        user: User = Depends(require_operator),
+                        db: Session = Depends(get_db)):
+    """Accept raw CSV text and import contacts."""
+    csv_text: str = body.get("csv_text", "")
+    reader = csv.DictReader(io.StringIO(csv_text.strip()))
+    rows = []
+    for r in reader:
+        rows.append(ContactImportRow(
+            college_name=r.get("college_name", r.get("College Name", "")).strip(),
+            city=r.get("city", r.get("City", "Unknown")).strip(),
+            state=r.get("state", r.get("State", "Unknown")).strip(),
+            website=r.get("website", r.get("Website", None)) or None,
+            tpo_name=r.get("tpo_name", r.get("TPO Name", None)) or None,
+            tpo_email=r.get("tpo_email", r.get("TPO Email", None)) or None,
+            director_name=r.get("director_name", r.get("Director Name", None)) or None,
+            director_email=r.get("director_email", r.get("Director Email", None)) or None,
+        ))
+    return import_contacts(ContactImportRequest(rows=rows), user=user, db=db)
+
+
+# ---------- contact patch (parameterized — must be AFTER /import routes) ----------
+
 class ContactPatch(BaseModel):
     status: str | None = None
     notes: str | None = None
@@ -280,138 +420,6 @@ def stats(db: Session = Depends(get_db)):
     }
 
 
-# ---------- direct contact import ----------
-
-class ContactImportRow(BaseModel):
-    college_name: str
-    city: str = "Unknown"
-    state: str = "Unknown"
-    website: str | None = None
-    # TPO
-    tpo_name: str | None = None
-    tpo_email: str | None = None
-    # Director / Principal
-    director_name: str | None = None
-    director_email: str | None = None
-
-
-class ContactImportRequest(BaseModel):
-    rows: list[ContactImportRow]
-
-
-def _normalize(name: str) -> str:
-    return re.sub(r"\s+", " ", name.strip().lower())
-
-
-def _upsert_college(db: Session, row: ContactImportRow) -> College:
-    norm = _normalize(row.college_name)
-    college = db.query(College).filter_by(normalized_name=norm, city=row.city).first()
-    if not college:
-        college = College(
-            name=row.college_name.strip(),
-            normalized_name=norm,
-            city=row.city.strip(),
-            state=row.state.strip(),
-            website=row.website or None,
-            college_type=CollegeType.UNKNOWN,
-            discovery_source="manual_import",
-        )
-        db.add(college)
-        db.flush()
-    return college
-
-
-def _upsert_contact(db: Session, college: College, name: str, email: str | None,
-                    role: CanonicalRole) -> tuple[Contact, bool]:
-    """Return (contact, created). Dedup on college_id + email if email given, else name."""
-    existing = None
-    if email:
-        existing = db.query(Contact).filter_by(college_id=college.id, email=email.lower().strip()).first()
-    if not existing:
-        existing = db.query(Contact).filter_by(college_id=college.id, full_name=name.strip()).first()
-    if existing:
-        return existing, False
-    contact = Contact(
-        college_id=college.id,
-        full_name=name.strip(),
-        email=email.lower().strip() if email else None,
-        role=role,
-        confidence=95,
-        status=ContactStatus.VERIFIED,
-    )
-    db.add(contact)
-    db.flush()
-    db.add(ContactSource(
-        contact_id=contact.id,
-        field_name="email",
-        source_type=SourceType.MANUAL,
-        source_url="manual_import",
-        excerpt="Directly imported by operator",
-        collected_at=datetime.now(timezone.utc),
-    ))
-    return contact, True
-
-
-@router.post("/contacts/import")
-def import_contacts(body: ContactImportRequest,
-                    user: User = Depends(require_operator),
-                    db: Session = Depends(get_db)):
-    """Bulk-import colleges + contacts (TPO + Director) in one call."""
-    added_colleges = 0
-    added_contacts = 0
-    skipped_contacts = 0
-
-    for row in body.rows:
-        if not row.college_name.strip():
-            continue
-        college = _upsert_college(db, row)
-        if college.id is None:
-            added_colleges += 1
-
-        for name, email, role in [
-            (row.tpo_name, row.tpo_email, CanonicalRole.TPO),
-            (row.director_name, row.director_email, CanonicalRole.DIRECTOR),
-        ]:
-            if not name:
-                continue
-            _, created = _upsert_contact(db, college, name, email, role)
-            if created:
-                added_contacts += 1
-            else:
-                skipped_contacts += 1
-
-    db.commit()
-    return {
-        "ok": True,
-        "colleges_processed": len(body.rows),
-        "contacts_added": added_contacts,
-        "contacts_skipped": skipped_contacts,
-        "message": f"Added {added_contacts} contacts across {len(body.rows)} colleges.",
-    }
-
-
-@router.post("/contacts/import-csv")
-def import_contacts_csv(body: dict,
-                        user: User = Depends(require_operator),
-                        db: Session = Depends(get_db)):
-    """Accept raw CSV text and import contacts."""
-    csv_text: str = body.get("csv_text", "")
-    reader = csv.DictReader(io.StringIO(csv_text.strip()))
-    rows = []
-    for r in reader:
-        rows.append(ContactImportRow(
-            college_name=r.get("college_name", r.get("College Name", "")).strip(),
-            city=r.get("city", r.get("City", "Unknown")).strip(),
-            state=r.get("state", r.get("State", "Unknown")).strip(),
-            website=r.get("website", r.get("Website", None)) or None,
-            tpo_name=r.get("tpo_name", r.get("TPO Name", None)) or None,
-            tpo_email=r.get("tpo_email", r.get("TPO Email", None)) or None,
-            director_name=r.get("director_name", r.get("Director Name", None)) or None,
-            director_email=r.get("director_email", r.get("Director Email", None)) or None,
-        ))
-    return import_contacts(ContactImportRequest(rows=rows), user=user, db=db)
-
-
 # ---------- pipeline actions (UI-triggered) ----------
 
 @router.post("/pipeline/draft-emails")
@@ -453,6 +461,54 @@ def pipeline_send(limit: int = 25,
     from app.sender.providers import SMTPSender
     from app.sender.service import remaining_quota, send_approved_batch
 
+    s = get_settings()
+    # Validate SMTP config before attempting to send
+    if not s.smtp_host:
+        raise HTTPException(422, "SMTP_HOST is not configured. Set SMTP_HOST, SMTP_USERNAME, SMTP_PASSWORD, and SENDER_EMAIL in your .env file.")
+    if not s.sender_email or "example" in s.sender_email:
+        raise HTTPException(422, f"SENDER_EMAIL is not configured properly (current: '{s.sender_email}'). Set a real sender email in your .env file.")
+
+    try:
+        provider = SMTPSender()
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+
     quota = remaining_quota(db)
-    stats = send_approved_batch(db, SMTPSender(), limit=limit)
-    return {"sent": stats.get("sent", 0), "quota_remaining": quota}
+    result = send_approved_batch(db, provider, limit=limit)
+    return {
+        "sent": result.get("sent", 0),
+        "suppressed": result.get("suppressed", 0),
+        "failed": result.get("failed", 0),
+        "quota_remaining": result.get("quota_left", quota),
+    }
+
+
+@router.get("/pipeline/smtp-status")
+def smtp_status(user: User = Depends(require_operator)):
+    """Check whether SMTP is configured (does not test the connection)."""
+    s = get_settings()
+    configured = bool(
+        s.smtp_host
+        and s.smtp_username
+        and s.smtp_password
+        and s.sender_email
+        and "example" not in s.sender_email
+    )
+    return {
+        "configured": configured,
+        "smtp_host": s.smtp_host or "(not set)",
+        "smtp_port": s.smtp_port,
+        "smtp_username": s.smtp_username or "(not set)",
+        "sender_email": s.sender_email or "(not set)",
+        "sender_name": s.sender_name or "(not set)",
+        "daily_send_cap": s.daily_send_cap,
+        "hourly_send_cap": s.hourly_send_cap,
+        "missing": [
+            field for field, val in [
+                ("SMTP_HOST", s.smtp_host),
+                ("SMTP_USERNAME", s.smtp_username),
+                ("SMTP_PASSWORD", s.smtp_password),
+                ("SENDER_EMAIL", s.sender_email),
+            ] if not val
+        ] + (["SENDER_EMAIL (placeholder domain)"] if s.sender_email and "example" in s.sender_email else []),
+    }

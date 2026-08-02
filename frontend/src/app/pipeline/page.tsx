@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -98,6 +98,15 @@ export default function PipelinePage() {
   const [sending, setSending] = useState(false);
   const [sendResult, setSendResult] = useState<string | null>(null);
   const [dryRun, setDryRun] = useState(true);
+  // SMTP status
+  const [smtpStatus, setSmtpStatus] = useState<{ configured: boolean; smtp_host: string; sender_email: string; missing: string[] } | null>(null);
+
+  // Load SMTP status on mount
+  useEffect(() => {
+    api<{ configured: boolean; smtp_host: string; sender_email: string; missing: string[] }>("/api/pipeline/smtp-status")
+      .then(setSmtpStatus)
+      .catch(() => null); // silently ignore if not logged in yet
+  }, []);
 
   // ── CSV helpers ─────────────────────────────────────────────────────────────
   function handleCsvFile(e: React.ChangeEvent<HTMLInputElement>) {
@@ -183,13 +192,17 @@ export default function PipelinePage() {
         const res = await api<{ total: number; items: unknown[] }>("/api/drafts?status=APPROVED&limit=1");
         setSendResult(`DRY RUN: ${res.total} approved draft(s) ready to send. Toggle off dry-run to actually send.`);
       } else {
-        const res = await api<{ sent: number; quota_remaining: number }>(
+        const res = await api<{ sent: number; suppressed: number; failed: number; quota_remaining: number }>(
           "/api/pipeline/send", { method: "POST" }
         );
-        setSendResult(`✓ Sent ${res.sent} email(s). Quota remaining today: ${res.quota_remaining}`);
+        const parts = [`✓ Sent ${res.sent} email(s). Quota remaining today: ${res.quota_remaining}`];
+        if (res.suppressed > 0) parts.push(`${res.suppressed} suppressed (unsubscribed/bounced)`);
+        if (res.failed > 0) parts.push(`⚠ ${res.failed} failed — check server logs`);
+        setSendResult(parts.join(" · "));
       }
     } catch (e) {
-      setSendResult(`ℹ Run via CLI: docker compose exec api python -m app.cli send${dryRun ? " --dry-run" : ""}\n(Error: ${e instanceof Error ? e.message : String(e)})`);
+      // Show the actual error from the server so the user knows what to fix
+      setSendResult(`⚠ Error: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setSending(false);
     }
@@ -511,6 +524,24 @@ export default function PipelinePage() {
           <p style={{ fontSize: 12, color: "#6b9e7e", margin: 0, lineHeight: 1.6 }}>
             Sends all approved drafts via your SMTP. Rate-limited to 25/day. Suppression list enforced — no one gets emailed twice without consent.
           </p>
+          {/* SMTP config status */}
+          {smtpStatus && (
+            <div style={{
+              background: smtpStatus.configured ? "#f0fdf4" : "#fff5f5",
+              border: `1px solid ${smtpStatus.configured ? "#bbf7d0" : "#fecaca"}`,
+              borderRadius: 8, padding: "8px 12px", fontSize: 11
+            }}>
+              {smtpStatus.configured ? (
+                <span style={{ color: "#15803d", fontWeight: 600 }}>
+                  ✓ SMTP ready — {smtpStatus.smtp_host} · from {smtpStatus.sender_email}
+                </span>
+              ) : (
+                <span style={{ color: "#dc2626", fontWeight: 600 }}>
+                  ⚠ SMTP not fully configured — missing: {smtpStatus.missing.join(", ")}
+                </span>
+              )}
+            </div>
+          )}
           {/* Dry run toggle */}
           <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
             <div onClick={() => setDryRun(!dryRun)} style={{
@@ -527,8 +558,16 @@ export default function PipelinePage() {
             </span>
           </label>
           {sendResult && (
-            <div style={{ background: sendResult.startsWith("✓") ? "#f0fdf4" : "#fffbeb", border: `1px solid ${sendResult.startsWith("✓") ? "#bbf7d0" : "#fde68a"}`, borderRadius: 8, padding: "8px 12px" }}>
-              <p style={{ fontSize: 11, color: sendResult.startsWith("✓") ? "#15803d" : "#92400e", margin: 0, fontFamily: "monospace", whiteSpace: "pre-wrap" }}>{sendResult}</p>
+            <div style={{
+              background: sendResult.startsWith("✓") ? "#f0fdf4" : sendResult.startsWith("⚠") ? "#fff5f5" : "#fffbeb",
+              border: `1px solid ${sendResult.startsWith("✓") ? "#bbf7d0" : sendResult.startsWith("⚠") ? "#fecaca" : "#fde68a"}`,
+              borderRadius: 8, padding: "8px 12px"
+            }}>
+              <p style={{
+                fontSize: 11,
+                color: sendResult.startsWith("✓") ? "#15803d" : sendResult.startsWith("⚠") ? "#dc2626" : "#92400e",
+                margin: 0, fontFamily: "monospace", whiteSpace: "pre-wrap"
+              }}>{sendResult}</p>
             </div>
           )}
           <button onClick={sendEmails} disabled={sending}

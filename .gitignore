@@ -1,7 +1,36 @@
+# --- secrets (never commit) ---
 .env
+*.pem
+*.json.bak
+
+# --- Python ---
 .venv/
 __pycache__/
 *.pyc
+*.pyo
 *.db
+*.sqlite3
+.pytest_cache/
+dist/
+*.egg-info/
+
+# --- Node / Next.js ---
 node_modules/
 .next/
+.vercel/
+frontend/.env.local
+
+# --- Cloudflare ---
+# The tunnel credentials JSON contains a secret — never commit it.
+# Store it at %USERPROFILE%\.cloudflared\<UUID>.json (outside the repo).
+*.cfargotunnel.com
+cloudflared-*.json
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Editor ---
+.vscode/settings.json
+.idea/
