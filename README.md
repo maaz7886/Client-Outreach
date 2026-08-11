@@ -381,4 +381,7 @@ To start manually:
 
 ---
 
+rebuild image after doing any changes in python code : docker compose up -d --build api
+
+
 *Built by AIValytics — BUILD · LEARN · DEPLOY*

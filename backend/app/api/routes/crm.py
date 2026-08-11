@@ -248,11 +248,94 @@ def import_contacts_csv(body: dict,
     return import_contacts(ContactImportRequest(rows=rows), user=user, db=db)
 
 
-# ---------- contact patch (parameterized — must be AFTER /import routes) ----------
+# ---------- college patch / delete ----------
+
+class CollegePatch(BaseModel):
+    name: str | None = None
+    city: str | None = None
+    state: str | None = None
+    website: str | None = None
+    naac_grade: str | None = None
+    nirf_rank: int | None = None
+    college_type: str | None = None
+    affiliation: str | None = None
+
+
+@router.patch("/colleges/{college_id}")
+def patch_college(college_id: int, body: CollegePatch,
+                  user: User = Depends(require_operator), db: Session = Depends(get_db)):
+    college = db.get(College, college_id)
+    if not college:
+        raise HTTPException(404, "College not found")
+    if body.name is not None:
+        college.name = body.name.strip()
+        college.normalized_name = re.sub(r"\s+", " ", body.name.strip().lower())
+    if body.city is not None:
+        college.city = body.city.strip()
+    if body.state is not None:
+        college.state = body.state.strip()
+    if body.website is not None:
+        college.website = body.website.strip() or None
+    if body.naac_grade is not None:
+        college.naac_grade = body.naac_grade.strip() or None
+    if body.nirf_rank is not None:
+        college.nirf_rank = body.nirf_rank
+    if body.college_type is not None:
+        try:
+            college.college_type = CollegeType(body.college_type.upper())
+        except ValueError:
+            raise HTTPException(422, f"Unknown college type {body.college_type!r}")
+    if body.affiliation is not None:
+        college.affiliation = body.affiliation.strip() or None
+    from app.models import AuditLog
+    db.add(AuditLog(user_id=user.id, action="college.update", entity_type="college",
+                    entity_id=college.id, detail=body.model_dump(exclude_none=True)))
+    db.commit()
+    return {"ok": True}
+
+
+@router.delete("/colleges/{college_id}")
+def delete_college(college_id: int,
+                   user: User = Depends(require_operator), db: Session = Depends(get_db)):
+    college = db.get(College, college_id)
+    if not college:
+        raise HTTPException(404, "College not found")
+    from app.models import (
+        AuditLog, EmailDraft, EmailEvent, EmailMessage, FollowupSchedule,
+    )
+    # Delete child records in dependency order to avoid FK violations.
+    # contacts.id is referenced by: email_drafts, email_messages, followup_schedules.
+    # email_messages.id is referenced by: email_events.
+    # email_drafts.id is referenced by: email_messages.
+    contact_ids = [c.id for c in college.contacts]
+    if contact_ids:
+        # events → messages → drafts → followups (then contacts cascade via SQLAlchemy)
+        msg_ids = [m.id for m in db.query(EmailMessage).filter(
+            EmailMessage.contact_id.in_(contact_ids)).all()]
+        if msg_ids:
+            db.query(EmailEvent).filter(EmailEvent.message_id.in_(msg_ids)).delete(
+                synchronize_session=False)
+        db.query(EmailMessage).filter(
+            EmailMessage.contact_id.in_(contact_ids)).delete(synchronize_session=False)
+        db.query(EmailDraft).filter(
+            EmailDraft.contact_id.in_(contact_ids)).delete(synchronize_session=False)
+        db.query(FollowupSchedule).filter(
+            FollowupSchedule.contact_id.in_(contact_ids)).delete(synchronize_session=False)
+    db.add(AuditLog(user_id=user.id, action="college.delete", entity_type="college",
+                    entity_id=college.id, detail={"name": college.name}))
+    db.delete(college)
+    db.commit()
+    return {"ok": True}
+
+
+# ---------- contact patch / delete (parameterized — must be AFTER /import routes) ----------
 
 class ContactPatch(BaseModel):
     status: str | None = None
     notes: str | None = None
+    full_name: str | None = None
+    email: str | None = None
+    role: str | None = None
 
 
 _MANUAL_STATUSES = {  # transitions an operator may set by hand
@@ -278,12 +361,45 @@ def patch_contact(contact_id: int, body: ContactPatch,
         contact.status = new_status
     if body.notes is not None:
         contact.notes = body.notes
+    if body.full_name is not None:
+        contact.full_name = body.full_name.strip()
+    if body.email is not None:
+        contact.email = body.email.strip().lower() or None
+    if body.role is not None:
+        try:
+            from app.models.base import CanonicalRole
+            contact.role = CanonicalRole(body.role.upper())
+        except ValueError:
+            raise HTTPException(422, f"Unknown role {body.role!r}")
     from app.models import AuditLog
-
     db.add(AuditLog(user_id=user.id, action="contact.update", entity_type="contact",
                     entity_id=contact.id, detail=body.model_dump(exclude_none=True)))
     db.commit()
     return {"ok": True, "status": contact.status.value}
+
+
+@router.delete("/contacts/{contact_id}")
+def delete_contact(contact_id: int,
+                   user: User = Depends(require_operator), db: Session = Depends(get_db)):
+    contact = db.get(Contact, contact_id)
+    if not contact:
+        raise HTTPException(404, "Contact not found")
+    from app.models import (
+        AuditLog, EmailDraft, EmailEvent, EmailMessage, FollowupSchedule,
+    )
+    # Delete child records in dependency order to avoid FK violations.
+    msg_ids = [m.id for m in db.query(EmailMessage).filter_by(contact_id=contact_id).all()]
+    if msg_ids:
+        db.query(EmailEvent).filter(EmailEvent.message_id.in_(msg_ids)).delete(
+            synchronize_session=False)
+    db.query(EmailMessage).filter_by(contact_id=contact_id).delete(synchronize_session=False)
+    db.query(EmailDraft).filter_by(contact_id=contact_id).delete(synchronize_session=False)
+    db.query(FollowupSchedule).filter_by(contact_id=contact_id).delete(synchronize_session=False)
+    db.add(AuditLog(user_id=user.id, action="contact.delete", entity_type="contact",
+                    entity_id=contact.id, detail={"name": contact.full_name}))
+    db.delete(contact)
+    db.commit()
+    return {"ok": True}
 
 
 # ---------- drafts ----------

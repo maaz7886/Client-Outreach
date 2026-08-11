@@ -343,15 +343,17 @@ export default function PipelinePage() {
                   </p>
                   <div style={{ overflowX: "auto" }}>
                     <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
-                      {csvPreview.map((row, ri) => (
-                        <tr key={ri} style={{ background: ri === 0 ? "#f0f7f3" : ri % 2 === 0 ? "#fff" : "#fafcfb" }}>
-                          {row.map((cell, ci) => (
-                            <td key={ci} style={{ padding: "6px 12px", borderBottom: "1px solid #f0f7f3", fontWeight: ri === 0 ? 700 : 400, color: ri === 0 ? "#0f3622" : "#4a7a5c", whiteSpace: "nowrap" }}>
-                              {cell.replace(/"/g, "")}
-                            </td>
-                          ))}
-                        </tr>
-                      ))}
+                      <tbody>
+                        {csvPreview.map((row, ri) => (
+                          <tr key={ri} style={{ background: ri === 0 ? "#f0f7f3" : ri % 2 === 0 ? "#fff" : "#fafcfb" }}>
+                            {row.map((cell, ci) => (
+                              <td key={ci} style={{ padding: "6px 12px", borderBottom: "1px solid #f0f7f3", fontWeight: ri === 0 ? 700 : 400, color: ri === 0 ? "#0f3622" : "#4a7a5c", whiteSpace: "nowrap" }}>
+                                {cell.replace(/"/g, "")}
+                              </td>
+                            ))}
+                          </tr>
+                        ))}
+                      </tbody>
                     </table>
                   </div>
                 </div>
@@ -480,19 +482,16 @@ export default function PipelinePage() {
           )}
 
           <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
-            <button onClick={generateDrafts} disabled={drafting || !importResult}
+            <button onClick={generateDrafts} disabled={drafting}
               style={{
-                background: drafting || !importResult ? "#e5e7eb" : "linear-gradient(135deg,#92400e,#d97706)",
-                color: drafting || !importResult ? "#9ca3af" : "#fff",
+                background: drafting ? "#e5e7eb" : "linear-gradient(135deg,#92400e,#d97706)",
+                color: drafting ? "#9ca3af" : "#fff",
                 border: "none", borderRadius: 10, padding: "12px 28px",
-                fontSize: 14, fontWeight: 800, cursor: drafting || !importResult ? "not-allowed" : "pointer",
-                boxShadow: drafting || !importResult ? "none" : "0 2px 12px rgba(217,119,6,0.3)"
+                fontSize: 14, fontWeight: 800, cursor: drafting ? "not-allowed" : "pointer",
+                boxShadow: drafting ? "none" : "0 2px 12px rgba(217,119,6,0.3)"
               }}>
               {drafting ? "⟳ Generating…" : "✍️ Generate Email Drafts"}
             </button>
-            {!importResult && (
-              <span style={{ fontSize: 12, color: "#94b5a0" }}>← Complete Step 1 first</span>
-            )}
           </div>
         </div>
       </div>
