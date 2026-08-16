@@ -12,7 +12,11 @@ const nav = [
   { href: "/pipeline", label: "⚙ Pipeline" },
   { href: "/colleges", label: "Colleges" },
   { href: "/contacts", label: "Contacts" },
+  { href: "/lists", label: "Lists" },
+  { href: "/templates", label: "Templates" },
   { href: "/drafts", label: "Approval Queue" },
+  { href: "/campaigns", label: "Campaigns" },
+  { href: "/senders", label: "Senders" },
 ];
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

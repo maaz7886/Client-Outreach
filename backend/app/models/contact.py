@@ -58,6 +58,11 @@ class Contact(TimestampMixin, Base):
     sources: Mapped[list["ContactSource"]] = relationship(
         back_populates="contact", cascade="all, delete-orphan"
     )
+    lists: Mapped[list["ContactList"]] = relationship(  # noqa: F821
+        "ContactList",
+        secondary="contact_list_members",
+        back_populates="contacts",
+    )
 
 
 class ContactSource(Base):

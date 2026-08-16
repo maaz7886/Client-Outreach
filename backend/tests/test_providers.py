@@ -108,6 +108,23 @@ def test_smtp_send_success(smtp):
     assert ("send", "tpo@abc.ac.in") in calls
 
 
+def test_smtp_send_with_attachments(smtp):
+    from app.sender.providers import EmailAttachment
+
+    email = OutgoingEmail(
+        to="tpo@abc.ac.in", subject="Hi", body_text="Body",
+        from_name="Maaz", from_email="maaz@outreach.example",
+        attachments=[
+            EmailAttachment(filename="brochure.pdf", content=b"%PDF-1.4", mime_type="application/pdf"),
+            EmailAttachment(filename="notes.txt", content=b"hello", mime_type="text/plain"),
+        ],
+    )
+    result = make_sender().send(email)
+    assert result.ok
+    sent_msg = next(c[1] for c in smtp.instances[0].calls if c[0] == "send")
+    assert sent_msg.get_payload()  # multipart when attachments present
+
+
 def test_smtp_recipient_refused_is_clean_failure(smtp):
     smtp.fail_with = smtplib.SMTPRecipientsRefused({"tpo@abc.ac.in": (550, b"no user")})
     result = make_sender().send(EMAIL)

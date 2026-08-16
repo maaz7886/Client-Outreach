@@ -45,6 +45,33 @@ export async function api<T = unknown>(
   return resp.json() as Promise<T>;
 }
 
+export async function apiUpload<T = unknown>(
+  path: string,
+  formData: FormData,
+  method: "POST" | "PUT" = "POST",
+): Promise<T> {
+  const headers: Record<string, string> = {};
+  const token = getToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+
+  const resp = await fetch(`${BASE}${path}`, { method, headers, body: formData });
+  if (resp.status === 401 && typeof window !== "undefined") {
+    setToken(null);
+    if (!window.location.pathname.startsWith("/login")) {
+      window.location.href = "/login";
+    }
+  }
+  if (!resp.ok) {
+    let detail = resp.statusText;
+    try {
+      const body = await resp.json();
+      detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
+    } catch {}
+    throw new ApiError(resp.status, detail);
+  }
+  return resp.json() as Promise<T>;
+}
+
 export async function login(email: string, password: string): Promise<void> {
   const data = await api<{ access_token: string }>("/auth/login", {
     method: "POST",

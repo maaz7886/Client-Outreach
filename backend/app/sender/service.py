@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.models import (
+    Attachment,
     Contact,
     ContactStatus,
     DraftStatus,
@@ -31,7 +32,8 @@ from app.models import (
 )
 from app.personalize.lint import UNSUBSCRIBE_TOKEN
 from app.sender.links import unsubscribe_url
-from app.sender.providers import EmailSenderProvider, OutgoingEmail
+from app.sender.providers import EmailAttachment, EmailSenderProvider, OutgoingEmail
+from app.sender.storage import read_bytes
 
 
 def _utcnow() -> datetime:
@@ -64,11 +66,30 @@ def render_body(draft: EmailDraft, contact: Contact) -> str:
     return (draft.body_text or "").replace(UNSUBSCRIBE_TOKEN, unsubscribe_url(contact.id))
 
 
+def load_draft_attachments(db: Session, draft_id: int) -> list[EmailAttachment]:
+    rows = db.query(Attachment).filter_by(draft_id=draft_id).order_by(Attachment.id).all()
+    return [
+        EmailAttachment(
+            filename=a.original_filename,
+            content=read_bytes(a.storage_path),
+            mime_type=a.mime_type,
+        )
+        for a in rows
+    ]
+
+
 def send_approved_batch(
-    db: Session, provider: EmailSenderProvider, limit: int | None = None
+    db: Session,
+    provider: EmailSenderProvider,
+    limit: int | None = None,
+    contact_ids: list[int] | None = None,
+    from_name: str | None = None,
+    from_email: str | None = None,
 ) -> dict:
     """Send approved drafts up to quota. Returns counters for the operator."""
     s = get_settings()
+    sender_name = from_name or s.sender_name or "AIValytics"
+    sender_email = from_email or s.sender_email
     quota = remaining_quota(db)
     if limit is not None:
         quota = min(quota, limit)
@@ -77,13 +98,14 @@ def send_approved_batch(
     if quota <= 0:
         return stats
 
-    drafts = (
-        db.query(EmailDraft)
-        .filter(EmailDraft.status == DraftStatus.APPROVED)
-        .order_by(EmailDraft.approved_at)
-        .limit(quota)
-        .all()
-    )
+    if contact_ids is not None and not contact_ids:
+        stats["quota_left"] = remaining_quota(db)
+        return stats
+
+    query = db.query(EmailDraft).filter(EmailDraft.status == DraftStatus.APPROVED)
+    if contact_ids is not None:
+        query = query.filter(EmailDraft.contact_id.in_(contact_ids))
+    drafts = query.order_by(EmailDraft.approved_at).limit(quota).all()
     for draft in drafts:
         contact = db.get(Contact, draft.contact_id)
         if not contact or not contact.email:
@@ -99,8 +121,9 @@ def send_approved_batch(
                 to=contact.email,
                 subject=draft.chosen_subject or (draft.subject_options or ["(no subject)"])[0],
                 body_text=render_body(draft, contact),
-                from_name=s.sender_name or "AIValytics",
-                from_email=s.sender_email,
+                from_name=sender_name,
+                from_email=sender_email,
+                attachments=load_draft_attachments(db, draft.id),
             )
         )
         message = EmailMessage(

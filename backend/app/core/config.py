@@ -46,6 +46,11 @@ class Settings(BaseSettings):
     max_touches: int = 4             # 1 initial + 3 follow-ups, never more
     followup_days: tuple[int, int, int] = (3, 7, 14)
 
+    # --- attachments ---
+    attachment_storage_dir: str = "data/attachments"
+    max_attachment_size_bytes: int = 25 * 1024 * 1024
+    max_attachments_per_draft: int = 10
+
 
 @lru_cache
 def get_settings() -> Settings:

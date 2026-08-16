@@ -1,13 +1,29 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
-import { api } from "@/lib/api";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { api, apiUpload } from "@/lib/api";
+
+type AttachmentInfo = {
+  id: number;
+  filename: string;
+  original_filename: string;
+  mime_type: string;
+  size: number;
+  uploaded_at: string;
+};
 
 type Draft = {
   id: number; contact: string; college: string; email: string | null;
   touch: number; chosen_subject: string | null; subject_options: string[] | null;
   body_text: string | null; lint: { ok: boolean; errors: string[]; warnings: string[] } | null;
+  attachments?: AttachmentInfo[];
 };
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
 
 export default function DraftsPage() {
   const [drafts, setDrafts] = useState<Draft[]>([]);
@@ -89,27 +105,194 @@ export default function DraftsPage() {
       )}
 
       {drafts.map((d) => (
-        <DraftCard key={d.id} draft={d} onAct={act} onSave={saveEdit} />
+        <DraftCard key={d.id} draft={d} onAct={act} onSave={saveEdit} onAttachmentsChange={load} />
       ))}
     </div>
   );
 }
 
-function DraftCard({ draft, onAct, onSave }: {
+function DraftCard({ draft, onAct, onSave, onAttachmentsChange }: {
   draft: Draft;
   onAct: (id: number, action: "approve" | "reject") => void;
   onSave: (draft: Draft, body: string, subject: string) => void;
+  onAttachmentsChange: () => void;
 }) {
   const [body, setBody] = useState(draft.body_text ?? "");
   const [subject, setSubject] = useState(draft.chosen_subject ?? "");
   const [editing, setEditing] = useState(false);
+  const [attachments, setAttachments] = useState<AttachmentInfo[]>(draft.attachments ?? []);
+  const [attBusy, setAttBusy] = useState(false);
+  const [attError, setAttError] = useState<string | null>(null);
+  const uploadRef = useRef<HTMLInputElement>(null);
+  const replaceRef = useRef<HTMLInputElement>(null);
+  const replaceTargetRef = useRef<number | null>(null);
   const lintOk = draft.lint?.ok ?? false;
 
   useEffect(() => {
     setBody(draft.body_text ?? "");
     setSubject(draft.chosen_subject ?? "");
     setEditing(false);
+    setAttachments(draft.attachments ?? []);
+    setAttError(null);
   }, [draft]);
+
+  async function uploadFiles(fileList: FileList | null) {
+    if (!fileList?.length) return;
+    setAttBusy(true);
+    setAttError(null);
+    try {
+      const form = new FormData();
+      Array.from(fileList).forEach((f) => form.append("files", f));
+      const res = await apiUpload<{ items: AttachmentInfo[] }>(
+        `/api/drafts/${draft.id}/attachments`,
+        form,
+      );
+      setAttachments((prev) => [...prev, ...res.items]);
+      onAttachmentsChange();
+    } catch (e) {
+      setAttError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setAttBusy(false);
+      if (uploadRef.current) uploadRef.current.value = "";
+    }
+  }
+
+  async function removeAttachment(id: number) {
+    setAttBusy(true);
+    setAttError(null);
+    try {
+      await api(`/api/drafts/${draft.id}/attachments/${id}`, { method: "DELETE" });
+      setAttachments((prev) => prev.filter((a) => a.id !== id));
+      onAttachmentsChange();
+    } catch (e) {
+      setAttError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setAttBusy(false);
+    }
+  }
+
+  function startReplace(id: number) {
+    replaceTargetRef.current = id;
+    replaceRef.current?.click();
+  }
+
+  async function handleReplace(fileList: FileList | null) {
+    const id = replaceTargetRef.current;
+    const file = fileList?.[0];
+    replaceTargetRef.current = null;
+    if (!id || !file) return;
+    setAttBusy(true);
+    setAttError(null);
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      const updated = await apiUpload<AttachmentInfo>(
+        `/api/drafts/${draft.id}/attachments/${id}`,
+        form,
+        "PUT",
+      );
+      setAttachments((prev) => prev.map((a) => (a.id === id ? updated : a)));
+      onAttachmentsChange();
+    } catch (e) {
+      setAttError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setAttBusy(false);
+      if (replaceRef.current) replaceRef.current.value = "";
+    }
+  }
+
+  const attachmentSection = (
+    <div style={{ borderTop: "1px solid #e8f0ec", paddingTop: 14, marginTop: 14 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+        <p style={{ fontSize: 11, fontWeight: 700, color: "#3d6b4f", textTransform: "uppercase", letterSpacing: "0.06em", margin: 0 }}>
+          Attachments ({attachments.length})
+        </p>
+        <button
+          type="button"
+          disabled={attBusy}
+          onClick={() => uploadRef.current?.click()}
+          style={{
+            background: "#e8f5ee", color: "#1a5c38", border: "1px solid #cce0d4",
+            borderRadius: 6, padding: "5px 12px", fontSize: 11, fontWeight: 700,
+            cursor: attBusy ? "not-allowed" : "pointer",
+          }}
+        >
+          + Add files
+        </button>
+      </div>
+      <input
+        ref={uploadRef}
+        type="file"
+        multiple
+        accept=".pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.csv,.txt,.zip,.rar,.png,.jpeg,.jpg,.webp"
+        style={{ display: "none" }}
+        onChange={(e) => uploadFiles(e.target.files)}
+      />
+      <input
+        ref={replaceRef}
+        type="file"
+        accept=".pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.csv,.txt,.zip,.rar,.png,.jpeg,.jpg,.webp"
+        style={{ display: "none" }}
+        onChange={(e) => handleReplace(e.target.files)}
+      />
+      {attError && (
+        <p style={{ fontSize: 12, color: "#dc2626", margin: "0 0 10px" }}>⚠ {attError}</p>
+      )}
+      {attachments.length === 0 ? (
+        <p style={{ fontSize: 12, color: "#94b5a0", margin: 0 }}>
+          No attachments — PDF, DOC, images, and more supported.
+        </p>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {attachments.map((att) => (
+            <div
+              key={att.id}
+              style={{
+                display: "flex", alignItems: "center", justifyContent: "space-between",
+                background: "#f8faf9", border: "1px solid #e8f0ec", borderRadius: 8,
+                padding: "8px 12px", gap: 10,
+              }}
+            >
+              <div style={{ minWidth: 0 }}>
+                <p style={{ margin: 0, fontSize: 13, fontWeight: 600, color: "#0f3622", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  📎 {att.original_filename}
+                </p>
+                <p style={{ margin: "2px 0 0", fontSize: 11, color: "#6b9e7e" }}>
+                  {formatFileSize(att.size)} · {att.mime_type}
+                </p>
+              </div>
+              <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                <button
+                  type="button"
+                  disabled={attBusy}
+                  onClick={() => startReplace(att.id)}
+                  style={{
+                    background: "#fff", color: "#1a5c38", border: "1px solid #cce0d4",
+                    borderRadius: 6, padding: "4px 10px", fontSize: 11, fontWeight: 600,
+                    cursor: attBusy ? "not-allowed" : "pointer",
+                  }}
+                >
+                  Replace
+                </button>
+                <button
+                  type="button"
+                  disabled={attBusy}
+                  onClick={() => removeAttachment(att.id)}
+                  style={{
+                    background: "#fff5f5", color: "#dc2626", border: "1px solid #fecaca",
+                    borderRadius: 6, padding: "4px 10px", fontSize: 11, fontWeight: 600,
+                    cursor: attBusy ? "not-allowed" : "pointer",
+                  }}
+                >
+                  Remove
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
 
   return (
     <div style={{
@@ -180,6 +363,7 @@ function DraftCard({ draft, onAct, onSave }: {
                 Cancel
               </button>
             </div>
+            {attachmentSection}
           </div>
         ) : (
           <>
@@ -194,7 +378,8 @@ function DraftCard({ draft, onAct, onSave }: {
             }}>
               {draft.body_text}
             </pre>
-            <div style={{ display: "flex", gap: 8 }}>
+            {attachmentSection}
+            <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
               <button
                 onClick={() => onAct(draft.id, "approve")}
                 disabled={!lintOk}

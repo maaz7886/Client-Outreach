@@ -28,7 +28,39 @@ interface ImportResult {
   contacts_added: number;
   contacts_skipped: number;
   message: string;
+  list_id?: number;
+  list_name?: string;
+  contacts_associated?: number;
 }
+
+type ListOption = "new" | "existing";
+
+interface ListSummary {
+  id: number;
+  name: string;
+  contact_count: number;
+}
+
+type SenderProfileOption = {
+  id: number;
+  name: string;
+  display_name: string;
+  email_address: string;
+  enabled: boolean;
+};
+
+type DefaultSenderInfo = {
+  display_name: string;
+  email_address: string;
+  configured: boolean;
+  label: string;
+};
+
+type TemplateOption = {
+  id: number;
+  name: string;
+  description: string | null;
+};
 
 // ─── Sample CSV content ───────────────────────────────────────────────────────
 const SAMPLE_CSV = `college_name,city,state,website,tpo_name,tpo_email,director_name,director_email
@@ -50,8 +82,8 @@ const PIPELINE_STEPS = [
   },
   {
     number: 2, icon: "✍️", color: "#f59e0b", title: "Generate Drafts",
-    what: "The AI writes a personalized outreach email for each contact — referencing their college name, city, and role.",
-    how: "Groq LLM (free tier) generates a warm, professional email body + 5 subject line options. Automatically checks for spam words, proper length, and unsubscribe footer.",
+    what: "You select a list and optional email template, then the AI writes a personalized outreach email for each verified contact in that list.",
+    how: "Groq LLM generates a warm, professional email body + 5 subject line options. Templates add extra context/formatting without changing the core prompt. Automatically checks for spam words, proper length, and unsubscribe footer.",
     output: "Email drafts appear in the Approval Queue with lint pass/fail status.",
     time: "1-3 seconds per contact",
   },
@@ -64,8 +96,8 @@ const PIPELINE_STEPS = [
   },
   {
     number: 4, icon: "🚀", color: "#ef4444", title: "Send Emails",
-    what: "The system sends all approved emails through your SMTP/Brevo account with open & click tracking.",
-    how: "Rate-limited to 25/day and 10/hour (warm-up defaults). Suppression list checked — unsubscribed/bounced contacts are never emailed. Each email has a signed unsubscribe link.",
+    what: "You select a list and sender profile, then send approved emails. SMTP credentials stay in .env — only From Name and From Email change.",
+    how: "Rate-limited by daily/hourly caps. Suppression list checked — unsubscribed/bounced contacts are never emailed. Each email has a signed unsubscribe link.",
     output: "Emails delivered. Opens, clicks, bounces, and replies tracked on the Dashboard.",
     time: "~2 seconds per email",
   },
@@ -85,6 +117,11 @@ export default function PipelinePage() {
   const [csvFile, setCsvFile] = useState<File | null>(null);
   const [csvPreview, setCsvPreview] = useState<string[][]>([]);
   const [csvText, setCsvText] = useState("");
+  const [listOption, setListOption] = useState<ListOption>("new");
+  const [existingLists, setExistingLists] = useState<ListSummary[]>([]);
+  const [selectedListId, setSelectedListId] = useState<number | null>(null);
+  const [newListName, setNewListName] = useState("");
+  const [newListDescription, setNewListDescription] = useState("");
   // Manual tab state
   const [rows, setRows] = useState<CollegeRow[]>([EMPTY_ROW()]);
   // Shared state
@@ -93,19 +130,56 @@ export default function PipelinePage() {
   const [importError, setImportError] = useState<string | null>(null);
   // Draft generation state
   const [drafting, setDrafting] = useState(false);
+  const [draftListId, setDraftListId] = useState<number | null>(null);
+  const [draftTemplateId, setDraftTemplateId] = useState<string>("none");
+  const [emailTemplates, setEmailTemplates] = useState<TemplateOption[]>([]);
   const [draftResult, setDraftResult] = useState<string | null>(null);
   // Send state
+  const [sendListId, setSendListId] = useState<number | null>(null);
+  const [sendLimit, setSendLimit] = useState("");
+  const [sendProfileId, setSendProfileId] = useState<string>("default");
+  const [senderProfiles, setSenderProfiles] = useState<SenderProfileOption[]>([]);
+  const [defaultSender, setDefaultSender] = useState<DefaultSenderInfo | null>(null);
   const [sending, setSending] = useState(false);
   const [sendResult, setSendResult] = useState<string | null>(null);
   const [dryRun, setDryRun] = useState(true);
   // SMTP status
-  const [smtpStatus, setSmtpStatus] = useState<{ configured: boolean; smtp_host: string; sender_email: string; missing: string[] } | null>(null);
+  const [smtpStatus, setSmtpStatus] = useState<{
+    configured: boolean; smtp_host: string; sender_email: string; missing: string[];
+    default_sender?: DefaultSenderInfo;
+  } | null>(null);
 
   // Load SMTP status on mount
   useEffect(() => {
-    api<{ configured: boolean; smtp_host: string; sender_email: string; missing: string[] }>("/api/pipeline/smtp-status")
+    api<{
+      configured: boolean; smtp_host: string; sender_email: string; missing: string[];
+      default_sender?: DefaultSenderInfo;
+    }>("/api/pipeline/smtp-status")
       .then(setSmtpStatus)
-      .catch(() => null); // silently ignore if not logged in yet
+      .catch(() => null);
+    api<{ default: DefaultSenderInfo; items: SenderProfileOption[] }>("/api/sender-profiles")
+      .then((d) => {
+        setDefaultSender(d.default);
+        setSenderProfiles(d.items.filter((p) => p.enabled));
+      })
+      .catch(() => null);
+    api<{ total: number; items: TemplateOption[] }>("/api/templates")
+      .then((d) => setEmailTemplates(d.items))
+      .catch(() => null);
+  }, []);
+
+  // Load existing lists for CSV import and draft generation
+  useEffect(() => {
+    api<{ total: number; items: ListSummary[] }>("/api/lists")
+      .then((d) => {
+        setExistingLists(d.items);
+        if (d.items.length > 0) {
+          setSelectedListId((prev) => prev ?? d.items[0].id);
+          setDraftListId((prev) => prev ?? d.items[0].id);
+          setSendListId((prev) => prev ?? d.items[0].id);
+        }
+      })
+      .catch(() => null);
   }, []);
 
   // ── CSV helpers ─────────────────────────────────────────────────────────────
@@ -146,9 +220,20 @@ export default function PipelinePage() {
       let result: ImportResult;
       if (tab === "import") {
         if (!csvText) throw new Error("Please select a CSV file first.");
+        const payload: Record<string, unknown> = { csv_text: csvText };
+        if (listOption === "new") {
+          if (!newListName.trim()) throw new Error("Enter a name for the new list.");
+          payload.new_list_name = newListName.trim();
+          if (newListDescription.trim()) {
+            payload.new_list_description = newListDescription.trim();
+          }
+        } else {
+          if (!selectedListId) throw new Error("Select an existing list.");
+          payload.list_id = selectedListId;
+        }
         result = await api<ImportResult>("/api/contacts/import-csv", {
           method: "POST",
-          body: JSON.stringify({ csv_text: csvText }),
+          body: JSON.stringify(payload),
         });
       } else {
         const validRows = rows.filter((r) => r.college_name.trim());
@@ -168,15 +253,28 @@ export default function PipelinePage() {
 
   // ── Generate drafts ──────────────────────────────────────────────────────────
   async function generateDrafts() {
+    if (!draftListId) {
+      setDraftResult("⚠ Select a list first, or create one on the Lists page.");
+      return;
+    }
     setDrafting(true);
     setDraftResult(null);
     try {
-      const res = await api<{ drafted: number; lint_passed: number; lint_failed: number }>(
-        "/api/pipeline/draft-emails?limit=50", { method: "POST" }
+      const params = new URLSearchParams({ limit: "50" });
+      if (draftTemplateId !== "none") params.set("template_id", draftTemplateId);
+      const res = await api<{
+        drafted: number; lint_passed: number; lint_failed: number;
+        list_name: string; eligible_contacts: number;
+        template_name?: string;
+      }>(`/api/lists/${draftListId}/draft-emails?${params.toString()}`, { method: "POST" });
+      const listLabel = res.list_name ? ` for "${res.list_name}"` : "";
+      const templateLabel = res.template_name ? ` using template "${res.template_name}"` : "";
+      setDraftResult(
+        `✓ Generated ${res.drafted} draft${res.drafted === 1 ? "" : "s"}${listLabel}${templateLabel} — ` +
+        `${res.lint_passed} passed lint, ${res.lint_failed} need editing.`
       );
-      setDraftResult(`✓ Generated ${res.drafted} drafts — ${res.lint_passed} passed lint, ${res.lint_failed} need editing.`);
     } catch (e) {
-      setDraftResult(`ℹ Run via CLI: docker compose exec api python -m app.cli draft-emails --limit 50\n(Error: ${e instanceof Error ? e.message : String(e)})`);
+      setDraftResult(`⚠ ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setDrafting(false);
     }
@@ -184,24 +282,46 @@ export default function PipelinePage() {
 
   // ── Send approved drafts ─────────────────────────────────────────────────────
   async function sendEmails() {
+    if (!sendListId) {
+      setSendResult("⚠ Select a list first.");
+      return;
+    }
     setSending(true);
     setSendResult(null);
     try {
+      const params = new URLSearchParams();
+      if (dryRun) params.set("dry_run", "true");
+      if (sendLimit.trim()) params.set("limit", String(Number(sendLimit)));
+      if (sendProfileId !== "default") params.set("sender_profile_id", sendProfileId);
+      const qs = params.toString() ? `?${params.toString()}` : "";
       if (dryRun) {
-        // Just count approved drafts
-        const res = await api<{ total: number; items: unknown[] }>("/api/drafts?status=APPROVED&limit=1");
-        setSendResult(`DRY RUN: ${res.total} approved draft(s) ready to send. Toggle off dry-run to actually send.`);
-      } else {
-        const res = await api<{ sent: number; suppressed: number; failed: number; quota_remaining: number }>(
-          "/api/pipeline/send", { method: "POST" }
+        const res = await api<{
+          dry_run: boolean; ready_to_send: number; list_name: string; quota_remaining: number;
+        }>(`/api/lists/${sendListId}/send${qs}`, { method: "POST" });
+        setSendResult(
+          `DRY RUN: ${res.ready_to_send} approved draft(s) in "${res.list_name}" ready to send. ` +
+          `Quota remaining: ${res.quota_remaining}. Toggle off dry-run to actually send.`
         );
-        const parts = [`✓ Sent ${res.sent} email(s). Quota remaining today: ${res.quota_remaining}`];
+      } else {
+        const liveParams = new URLSearchParams();
+        if (sendLimit.trim()) liveParams.set("limit", String(Number(sendLimit)));
+        if (sendProfileId !== "default") liveParams.set("sender_profile_id", sendProfileId);
+        const liveQs = liveParams.toString() ? `?${liveParams.toString()}` : "";
+        const res = await api<{
+          sent: number; suppressed: number; failed: number; quota_remaining: number;
+          list_name: string; campaign_id?: number; campaign_name?: string;
+          from_name?: string; from_email?: string; sender_label?: string;
+        }>(`/api/lists/${sendListId}/send${liveQs}`, { method: "POST" });
+        const parts = [`✓ Sent ${res.sent} email(s) from "${res.list_name}". Quota remaining: ${res.quota_remaining}`];
+        if (res.from_name && res.from_email) {
+          parts.push(`From: ${res.from_name} <${res.from_email}>`);
+        }
         if (res.suppressed > 0) parts.push(`${res.suppressed} suppressed (unsubscribed/bounced)`);
         if (res.failed > 0) parts.push(`⚠ ${res.failed} failed — check server logs`);
+        if (res.campaign_name) parts.push(`Campaign: ${res.campaign_name}`);
         setSendResult(parts.join(" · "));
       }
     } catch (e) {
-      // Show the actual error from the server so the user knows what to fix
       setSendResult(`⚠ Error: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setSending(false);
@@ -358,6 +478,95 @@ export default function PipelinePage() {
                   </div>
                 </div>
               )}
+
+              {/* List assignment */}
+              {csvText && (
+                <div style={{ background: "#f8faf9", border: "1px solid #dceae2", borderRadius: 12, padding: "18px 20px", display: "flex", flexDirection: "column", gap: 14 }}>
+                  <div>
+                    <p style={{ fontWeight: 700, color: "#0f3622", fontSize: 14, margin: "0 0 4px" }}>Assign imported contacts to a list</p>
+                    <p style={{ fontSize: 12, color: "#6b9e7e", margin: 0 }}>
+                      Duplicate contacts are reused — only the list association is added.
+                    </p>
+                  </div>
+
+                  <div style={{ display: "flex", gap: 0, background: "#f0f7f3", borderRadius: 10, padding: 4, width: "fit-content" }}>
+                    {([["new", "➕ Create New List"], ["existing", "📋 Add to Existing List"]] as [ListOption, string][]).map(([id, label]) => (
+                      <button
+                        key={id}
+                        type="button"
+                        onClick={() => setListOption(id)}
+                        style={{
+                          background: listOption === id ? "#0f3622" : "transparent",
+                          color: listOption === id ? "#fff" : "#4a7a5c",
+                          border: "none", borderRadius: 8, padding: "8px 16px",
+                          fontSize: 12, fontWeight: 700, cursor: "pointer",
+                        }}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+
+                  {listOption === "new" ? (
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+                        <label style={{ fontSize: 11, fontWeight: 700, color: "#3d6b4f", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+                          New list name *
+                        </label>
+                        <input
+                          value={newListName}
+                          onChange={(e) => setNewListName(e.target.value)}
+                          placeholder="e.g. Karnataka TPOs — Aug 2026"
+                          style={{
+                            border: "1.5px solid #cce0d4", borderRadius: 8, padding: "8px 12px",
+                            fontSize: 13, color: "#0f1a14", background: "#fff", outline: "none",
+                          }}
+                        />
+                      </div>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+                        <label style={{ fontSize: 11, fontWeight: 700, color: "#3d6b4f", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+                          Description (optional)
+                        </label>
+                        <input
+                          value={newListDescription}
+                          onChange={(e) => setNewListDescription(e.target.value)}
+                          placeholder="What is this list for?"
+                          style={{
+                            border: "1.5px solid #cce0d4", borderRadius: 8, padding: "8px 12px",
+                            fontSize: 13, color: "#0f1a14", background: "#fff", outline: "none",
+                          }}
+                        />
+                      </div>
+                    </div>
+                  ) : (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 5, maxWidth: 420 }}>
+                      <label style={{ fontSize: 11, fontWeight: 700, color: "#3d6b4f", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+                        Select list *
+                      </label>
+                      {existingLists.length > 0 ? (
+                        <select
+                          value={selectedListId ?? ""}
+                          onChange={(e) => setSelectedListId(Number(e.target.value))}
+                          style={{
+                            border: "1.5px solid #cce0d4", borderRadius: 8, padding: "8px 12px",
+                            fontSize: 13, color: "#0f1a14", background: "#fff", outline: "none",
+                          }}
+                        >
+                          {existingLists.map((lst) => (
+                            <option key={lst.id} value={lst.id}>
+                              {lst.name} ({lst.contact_count} contact{lst.contact_count === 1 ? "" : "s"})
+                            </option>
+                          ))}
+                        </select>
+                      ) : (
+                        <p style={{ fontSize: 12, color: "#92400e", margin: 0, background: "#fffbeb", border: "1px solid #fde68a", borderRadius: 8, padding: "10px 12px" }}>
+                          No lists yet — switch to &quot;Create New List&quot; or create one on the Lists page first.
+                        </p>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           )}
 
@@ -421,7 +630,15 @@ export default function PipelinePage() {
               <p style={{ fontSize: 13, color: "#166534", margin: 0 }}>{importResult.message}</p>
               <p style={{ fontSize: 12, color: "#4ade80", margin: "4px 0 0" }}>
                 Colleges processed: {importResult.colleges_processed} · Contacts added: {importResult.contacts_added} · Skipped (duplicates): {importResult.contacts_skipped}
+                {importResult.list_name && (
+                  <> · Assigned to list: <strong>{importResult.list_name}</strong> ({importResult.contacts_associated ?? 0} contact{(importResult.contacts_associated ?? 0) === 1 ? "" : "s"})</>
+                )}
               </p>
+              {importResult.list_id && (
+                <a href="/lists" style={{ display: "inline-block", marginTop: 8, background: "#15803d", color: "#fff", borderRadius: 8, padding: "6px 16px", fontSize: 12, fontWeight: 700, textDecoration: "none" }}>
+                  → View Lists
+                </a>
+              )}
             </div>
           )}
           {importError && (
@@ -451,7 +668,7 @@ export default function PipelinePage() {
             <span style={{ fontSize: 22 }}>✍️</span>
             <div>
               <h2 style={{ color: "#fff", fontSize: 17, fontWeight: 800, margin: 0 }}>Step 2 — Generate Personalized Emails</h2>
-              <p style={{ color: "#fde68a", fontSize: 12, margin: "2px 0 0" }}>AI writes a custom email for each contact based on their college and role</p>
+              <p style={{ color: "#fde68a", fontSize: 12, margin: "2px 0 0" }}>Select a list and optional template — AI writes a custom email for each verified contact</p>
             </div>
           </div>
         </div>
@@ -471,9 +688,17 @@ export default function PipelinePage() {
           </div>
 
           {draftResult && (
-            <div style={{ background: "#f0fdf4", border: "1px solid #bbf7d0", borderRadius: 10, padding: "12px 16px" }}>
-              <p style={{ fontSize: 13, color: "#15803d", margin: 0, fontFamily: "monospace" }}>{draftResult}</p>
-              {draftResult.includes("Generated") && (
+            <div style={{
+              background: draftResult.startsWith("✓") ? "#f0fdf4" : draftResult.startsWith("⚠") ? "#fffbeb" : "#f0fdf4",
+              border: `1px solid ${draftResult.startsWith("✓") ? "#bbf7d0" : draftResult.startsWith("⚠") ? "#fde68a" : "#bbf7d0"}`,
+              borderRadius: 10, padding: "12px 16px",
+            }}>
+              <p style={{
+                fontSize: 13,
+                color: draftResult.startsWith("✓") ? "#15803d" : draftResult.startsWith("⚠") ? "#92400e" : "#15803d",
+                margin: 0, fontFamily: "monospace",
+              }}>{draftResult}</p>
+              {draftResult.startsWith("✓") && (
                 <a href="/drafts" style={{ display: "inline-block", marginTop: 8, background: "#15803d", color: "#fff", borderRadius: 8, padding: "6px 16px", fontSize: 12, fontWeight: 700, textDecoration: "none" }}>
                   → Open Approval Queue
                 </a>
@@ -481,8 +706,63 @@ export default function PipelinePage() {
             </div>
           )}
 
+          <div style={{ background: "#fffbeb", border: "1px solid #fde68a", borderRadius: 10, padding: "14px 16px", display: "flex", flexDirection: "column", gap: 8, maxWidth: 420 }}>
+            <label style={{ fontSize: 11, fontWeight: 700, color: "#92400e", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+              Select list *
+            </label>
+            {existingLists.length > 0 ? (
+              <select
+                value={draftListId ?? ""}
+                onChange={(e) => setDraftListId(Number(e.target.value))}
+                style={{
+                  border: "1.5px solid #fde68a", borderRadius: 8, padding: "8px 12px",
+                  fontSize: 13, color: "#0f1a14", background: "#fff", outline: "none",
+                }}
+              >
+                {existingLists.map((lst) => (
+                  <option key={lst.id} value={lst.id}>
+                    {lst.name} ({lst.contact_count} contact{lst.contact_count === 1 ? "" : "s"})
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <p style={{ fontSize: 12, color: "#92400e", margin: 0 }}>
+                No lists yet — import contacts into a list in Step 1, or create one on the{" "}
+                <a href="/lists" style={{ color: "#b45309", fontWeight: 700 }}>Lists</a> page.
+              </p>
+            )}
+            <p style={{ fontSize: 11, color: "#78350f", margin: 0, lineHeight: 1.5 }}>
+              Only VERIFIED contacts in this list without an existing draft will be processed.
+            </p>
+          </div>
+
+          <div style={{ background: "#fffbeb", border: "1px solid #fde68a", borderRadius: 10, padding: "14px 16px", display: "flex", flexDirection: "column", gap: 8, maxWidth: 420 }}>
+            <label style={{ fontSize: 11, fontWeight: 700, color: "#92400e", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+              Email template (optional)
+            </label>
+            <select
+              value={draftTemplateId}
+              onChange={(e) => setDraftTemplateId(e.target.value)}
+              style={{
+                border: "1.5px solid #fde68a", borderRadius: 8, padding: "8px 12px",
+                fontSize: 13, color: "#0f1a14", background: "#fff", outline: "none",
+              }}
+            >
+              <option value="none">No template — default generation</option>
+              {emailTemplates.map((t) => (
+                <option key={t.id} value={String(t.id)}>
+                  {t.name}{t.description ? ` — ${t.description}` : ""}
+                </option>
+              ))}
+            </select>
+            <p style={{ fontSize: 11, color: "#78350f", margin: 0, lineHeight: 1.5 }}>
+              Templates add context/formatting to the prompt. Manage on the{" "}
+              <a href="/templates" style={{ color: "#b45309", fontWeight: 700 }}>Templates</a> page.
+            </p>
+          </div>
+
           <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
-            <button onClick={generateDrafts} disabled={drafting}
+            <button onClick={generateDrafts} disabled={drafting || !draftListId}
               style={{
                 background: drafting ? "#e5e7eb" : "linear-gradient(135deg,#92400e,#d97706)",
                 color: drafting ? "#9ca3af" : "#fff",
@@ -521,7 +801,7 @@ export default function PipelinePage() {
             <span style={{ fontWeight: 700, color: "#0f3622", fontSize: 14 }}>Send Emails</span>
           </div>
           <p style={{ fontSize: 12, color: "#6b9e7e", margin: 0, lineHeight: 1.6 }}>
-            Sends all approved drafts via your SMTP. Rate-limited to 25/day. Suppression list enforced — no one gets emailed twice without consent.
+            Select a list, sender profile, and send approved drafts. SMTP credentials stay in .env — only From Name and From Email change.
           </p>
           {/* SMTP config status */}
           {smtpStatus && (
@@ -541,6 +821,76 @@ export default function PipelinePage() {
               )}
             </div>
           )}
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <label style={{ fontSize: 11, fontWeight: 700, color: "#991b1b", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+              Select list *
+            </label>
+            {existingLists.length > 0 ? (
+              <select
+                value={sendListId ?? ""}
+                onChange={(e) => setSendListId(Number(e.target.value))}
+                style={{
+                  border: "1.5px solid #fecaca", borderRadius: 8, padding: "8px 12px",
+                  fontSize: 13, color: "#0f1a14", background: "#fff", outline: "none",
+                }}
+              >
+                {existingLists.map((lst) => (
+                  <option key={lst.id} value={lst.id}>
+                    {lst.name} ({lst.contact_count} contact{lst.contact_count === 1 ? "" : "s"})
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <p style={{ fontSize: 12, color: "#92400e", margin: 0 }}>
+                No lists yet — create one on the{" "}
+                <a href="/lists" style={{ color: "#b45309", fontWeight: 700 }}>Lists</a> page.
+              </p>
+            )}
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <label style={{ fontSize: 11, fontWeight: 700, color: "#991b1b", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+              Sender profile *
+            </label>
+            <select
+              value={sendProfileId}
+              onChange={(e) => setSendProfileId(e.target.value)}
+              style={{
+                border: "1.5px solid #fecaca", borderRadius: 8, padding: "8px 12px",
+                fontSize: 13, color: "#0f1a14", background: "#fff", outline: "none",
+              }}
+            >
+              <option value="default">
+                {defaultSender
+                  ? `${defaultSender.label}: ${defaultSender.display_name} <${defaultSender.email_address || "not configured"}>`
+                  : "Default (.env)"}
+              </option>
+              {senderProfiles.map((p) => (
+                <option key={p.id} value={String(p.id)}>
+                  {p.name}: {p.display_name} &lt;{p.email_address}&gt;
+                </option>
+              ))}
+            </select>
+            <p style={{ fontSize: 11, color: "#78350f", margin: 0, lineHeight: 1.5 }}>
+              Manage profiles on the{" "}
+              <a href="/senders" style={{ color: "#b45309", fontWeight: 700 }}>Senders</a> page.
+            </p>
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 5, maxWidth: 160 }}>
+            <label style={{ fontSize: 11, fontWeight: 700, color: "#991b1b", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+              Max emails (optional)
+            </label>
+            <input
+              type="number"
+              min={1}
+              value={sendLimit}
+              onChange={(e) => setSendLimit(e.target.value)}
+              placeholder="Default: 25"
+              style={{
+                border: "1.5px solid #fecaca", borderRadius: 8, padding: "8px 12px",
+                fontSize: 13, color: "#0f1a14", background: "#fff", outline: "none",
+              }}
+            />
+          </div>
           {/* Dry run toggle */}
           <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
             <div onClick={() => setDryRun(!dryRun)} style={{
@@ -567,9 +917,14 @@ export default function PipelinePage() {
                 color: sendResult.startsWith("✓") ? "#15803d" : sendResult.startsWith("⚠") ? "#dc2626" : "#92400e",
                 margin: 0, fontFamily: "monospace", whiteSpace: "pre-wrap"
               }}>{sendResult}</p>
+              {sendResult.startsWith("✓") && sendResult.includes("Campaign:") && (
+                <a href="/campaigns" style={{ display: "inline-block", marginTop: 6, fontSize: 11, fontWeight: 700, color: "#15803d" }}>
+                  → View Campaign History
+                </a>
+              )}
             </div>
           )}
-          <button onClick={sendEmails} disabled={sending}
+          <button onClick={sendEmails} disabled={sending || !sendListId}
             style={{
               background: sending ? "#e5e7eb" : dryRun ? "linear-gradient(135deg,#92400e,#d97706)" : "linear-gradient(135deg,#991b1b,#ef4444)",
               color: sending ? "#9ca3af" : "#fff", border: "none", borderRadius: 8,

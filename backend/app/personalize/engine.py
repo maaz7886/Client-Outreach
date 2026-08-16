@@ -86,7 +86,7 @@ def _parse(raw: str) -> dict:
 
 def generate_draft(
     db: Session, contact: Contact, llm: LLMProvider, *, touch_number: int = 1,
-    max_attempts: int = 2,
+    max_attempts: int = 2, template_context: str | None = None,
 ) -> EmailDraft:
     """Create (or refresh) the draft for a contact/touch. Lint failures are
     retried once with the errors fed back, then stored as DRAFT with a failing
@@ -118,7 +118,8 @@ def generate_draft(
             "point of value from the fact sheet if available, keep it to 90-130 words, "
             "and make it easy to say no."
         )
-    user_prompt = f"FACT SHEET:\n{fact_sheet}"
+    template_block = f"\n\n{template_context}" if template_context else ""
+    user_prompt = f"FACT SHEET:\n{fact_sheet}{template_block}"
     report = {"ok": False, "errors": ["not generated"], "warnings": []}
     for _ in range(max_attempts):
         raw = llm.complete(system_prompt, user_prompt, max_tokens=1500)
@@ -138,7 +139,7 @@ def generate_draft(
         if report["ok"]:
             break
         user_prompt = (
-            f"FACT SHEET:\n{fact_sheet}\n\nYour previous draft failed these checks, "
+            f"FACT SHEET:\n{fact_sheet}{template_block}\n\nYour previous draft failed these checks, "
             f"fix them: {report['errors']}"
         )
 

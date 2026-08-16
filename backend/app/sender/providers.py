@@ -3,11 +3,18 @@
 Microsoft Graph adapters plug in here later without touching the service."""
 
 import smtplib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from email.message import EmailMessage as MimeMessage
 from typing import Protocol
 
 from app.core.config import get_settings
+
+
+@dataclass
+class EmailAttachment:
+    filename: str
+    content: bytes
+    mime_type: str
 
 
 @dataclass
@@ -17,6 +24,7 @@ class OutgoingEmail:
     body_text: str
     from_name: str
     from_email: str
+    attachments: list[EmailAttachment] = field(default_factory=list)
 
 
 class SendResult:
@@ -51,6 +59,14 @@ class SMTPSender:
         msg["To"] = email.to
         msg["Subject"] = email.subject
         msg.set_content(email.body_text)
+        for attachment in email.attachments:
+            maintype, _, subtype = attachment.mime_type.partition("/")
+            msg.add_attachment(
+                attachment.content,
+                maintype=maintype or "application",
+                subtype=subtype or "octet-stream",
+                filename=attachment.filename,
+            )
         try:
             with smtplib.SMTP(self.host, self.port, timeout=30) as smtp:
                 smtp.starttls()
