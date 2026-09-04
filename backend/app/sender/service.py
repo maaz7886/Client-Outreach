@@ -63,11 +63,27 @@ def remaining_quota(db: Session) -> int:
 
 
 def render_body(draft: EmailDraft, contact: Contact) -> str:
-    return (draft.body_text or "").replace(UNSUBSCRIBE_TOKEN, unsubscribe_url(contact.id))
+    body = (draft.body_text or "")
+    body = body.replace(f"Unsubscribe: {UNSUBSCRIBE_TOKEN}", "")
+    body = body.replace(UNSUBSCRIBE_TOKEN, "")
+    body = body.replace(f"Unsubscribe: {unsubscribe_url(contact.id)}", "")
+    return body.strip()
 
 
 def load_draft_attachments(db: Session, draft_id: int) -> list[EmailAttachment]:
     rows = db.query(Attachment).filter_by(draft_id=draft_id).order_by(Attachment.id).all()
+    return [
+        EmailAttachment(
+            filename=a.original_filename,
+            content=read_bytes(a.storage_path),
+            mime_type=a.mime_type,
+        )
+        for a in rows
+    ]
+
+
+def load_campaign_attachments(db: Session, campaign_id: int) -> list[EmailAttachment]:
+    rows = db.query(Attachment).filter_by(campaign_id=campaign_id).order_by(Attachment.id).all()
     return [
         EmailAttachment(
             filename=a.original_filename,
@@ -85,6 +101,7 @@ def send_approved_batch(
     contact_ids: list[int] | None = None,
     from_name: str | None = None,
     from_email: str | None = None,
+    campaign_id: int | None = None,
 ) -> dict:
     """Send approved drafts up to quota. Returns counters for the operator."""
     s = get_settings()
@@ -101,6 +118,11 @@ def send_approved_batch(
     if contact_ids is not None and not contact_ids:
         stats["quota_left"] = remaining_quota(db)
         return stats
+
+    # Load campaign-level attachments once for the batch
+    campaign_atts = []
+    if campaign_id is not None:
+        campaign_atts = load_campaign_attachments(db, campaign_id)
 
     query = db.query(EmailDraft).filter(EmailDraft.status == DraftStatus.APPROVED)
     if contact_ids is not None:
@@ -123,7 +145,7 @@ def send_approved_batch(
                 body_text=render_body(draft, contact),
                 from_name=sender_name,
                 from_email=sender_email,
-                attachments=load_draft_attachments(db, draft.id),
+                attachments=load_draft_attachments(db, draft.id) + campaign_atts,
             )
         )
         message = EmailMessage(

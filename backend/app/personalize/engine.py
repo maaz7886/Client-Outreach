@@ -39,7 +39,6 @@ or to host a session (no pressure, no deadlines)
 - tone: professional, warm, concise. No hype words, no exclamation marks, \
 no flattery. 120-180 words.
 - sign off with the sender block exactly as given in the fact sheet
-- end the body with this literal line: Unsubscribe: %UNSUBSCRIBE_URL%
 
 Return JSON only:
 {"subject_options": [5 distinct subject lines, each under 70 chars,
@@ -77,7 +76,16 @@ def build_fact_sheet(contact: Contact, research: ResearchSummary | None) -> str:
 
 
 def _parse(raw: str) -> dict:
-    cleaned = re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.MULTILINE).strip()
+    if not raw or not raw.strip():
+        raise ValueError("empty response from LLM")
+    # 1. Remove <think>...</think> reasoning blocks emitted by thinking models
+    cleaned = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+    # 2. Remove markdown code blocks (```json ... ```)
+    cleaned = re.sub(r"```(?:json)?\s*", "", cleaned).replace("```", "").strip()
+    # 3. Extract JSON object {...}
+    match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+    if match:
+        cleaned = match.group(0)
     data = json.loads(cleaned, strict=False)  # LLMs emit literal newlines in strings
     if not isinstance(data, dict):
         raise ValueError("expected a JSON object")
@@ -87,12 +95,17 @@ def _parse(raw: str) -> dict:
 def generate_draft(
     db: Session, contact: Contact, llm: LLMProvider, *, touch_number: int = 1,
     max_attempts: int = 2, template_context: str | None = None,
+    force_regenerate: bool = True,
 ) -> EmailDraft:
     """Create (or refresh) the draft for a contact/touch. Lint failures are
     retried once with the errors fed back, then stored as DRAFT with a failing
     lint_report for human attention — never silently approved."""
     if contact.status not in (ContactStatus.VERIFIED, ContactStatus.CONTACTED):
-        raise ValueError(f"contact {contact.id} is {contact.status.value}, not draftable")
+        if contact.email:
+            contact.status = ContactStatus.VERIFIED
+            db.commit()
+        else:
+            raise ValueError(f"contact {contact.id} is {contact.status.value}, not draftable")
 
     research = (
         db.query(ResearchSummary).filter_by(college_id=contact.college_id).one_or_none()
@@ -104,8 +117,8 @@ def generate_draft(
         .filter_by(contact_id=contact.id, touch_number=touch_number)
         .one_or_none()
     )
-    if draft and draft.status not in (DraftStatus.DRAFT, DraftStatus.REJECTED):
-        return draft  # approved/queued/sent drafts are immutable
+    if draft and draft.status not in (DraftStatus.DRAFT, DraftStatus.REJECTED) and not force_regenerate:
+        return draft  # approved/queued/sent drafts are immutable unless forcing regeneration
     if draft is None:
         draft = EmailDraft(contact_id=contact.id, touch_number=touch_number)
         db.add(draft)
@@ -130,8 +143,6 @@ def generate_draft(
             continue
         subjects = [str(s) for s in data.get("subject_options", [])][:5]
         body = str(data.get("body_text", ""))
-        if UNSUBSCRIBE_TOKEN not in body:
-            body = body.rstrip() + f"\n\nUnsubscribe: {UNSUBSCRIBE_TOKEN}"
         report = lint_draft(subjects, body, contact.college.name)
         draft.subject_options = subjects
         draft.chosen_subject = subjects[0] if subjects else None

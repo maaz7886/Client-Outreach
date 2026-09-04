@@ -46,9 +46,6 @@ def lint_draft(subject_options: list[str], body_text: str, college_name: str) ->
         if leaked:
             errors.append(f"template placeholder leaked: {leaked[:3]}")
 
-    if UNSUBSCRIBE_TOKEN not in (body_text or ""):
-        errors.append("missing unsubscribe token")
-
     if college_name and college_name.split()[0].lower() not in body_lower:
         errors.append("body never mentions the college")
 

@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import Link from "next/link";
 import { api } from "@/lib/api";
 
 type ListRow = {
@@ -314,7 +315,14 @@ export default function ListsPage() {
           <tbody>
             {rows.map((lst, i) => (
               <tr key={lst.id} style={{ borderTop: "1px solid #f0f7f3", background: i % 2 === 0 ? "#fff" : "#fafcfb" }}>
-                <td style={{ padding: "10px 14px", fontWeight: 600, color: "#0f3622" }}>{lst.name}</td>
+                <td style={{ padding: "10px 14px", fontWeight: 600, color: "#0f3622" }}>
+                  <Link href={`/lists/${lst.id}`} style={{ color: "#0f3622", textDecoration: "none" }}
+                    onMouseEnter={(e) => (e.currentTarget.style.color = "#1a5c38")}
+                    onMouseLeave={(e) => (e.currentTarget.style.color = "#0f3622")}
+                  >
+                    {lst.name}
+                  </Link>
+                </td>
                 <td style={{ padding: "10px 14px", color: "#4a7a5c", maxWidth: 280 }}>
                   {lst.description ?? <span style={{ color: "#c0d8c8" }}>—</span>}
                 </td>
@@ -331,9 +339,14 @@ export default function ListsPage() {
                   {formatDate(lst.created_at)}
                 </td>
                 <td style={{ padding: "10px 14px", whiteSpace: "nowrap" }}>
+                  <Link href={`/lists/${lst.id}`}
+                    style={{ display: "inline-block", background: "#e8f5ee", color: "#1a5c38", border: "none", borderRadius: 6, padding: "5px 12px", fontSize: 12, fontWeight: 600, cursor: "pointer", marginRight: 6, textDecoration: "none" }}
+                  >
+                    ✍️ View / Draft
+                  </Link>
                   <button
                     onClick={() => setRenaming(lst)}
-                    style={{ background: "#e8f5ee", color: "#1a5c38", border: "none", borderRadius: 6, padding: "5px 12px", fontSize: 12, fontWeight: 600, cursor: "pointer", marginRight: 6 }}
+                    style={{ background: "#f0f7f3", color: "#3d6b4f", border: "1px solid #cce0d4", borderRadius: 6, padding: "5px 12px", fontSize: 12, fontWeight: 600, cursor: "pointer", marginRight: 6 }}
                   >
                     ✏ Rename
                   </button>

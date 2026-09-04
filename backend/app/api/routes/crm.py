@@ -6,6 +6,7 @@ import re
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -655,6 +656,32 @@ def reject(draft_id: int, user: User = Depends(require_operator),
     return {"ok": True}
 
 
+class ApproveAllIn(BaseModel):
+    list_id: int | None = None
+
+
+@router.post("/drafts/approve-all")
+def approve_all_drafts(body: ApproveAllIn | None = None,
+                       user: User = Depends(require_operator),
+                       db: Session = Depends(get_db)):
+    query = db.query(EmailDraft).filter(EmailDraft.status == DraftStatus.DRAFT)
+    if body and body.list_id is not None:
+        lst = db.get(ContactList, body.list_id)
+        if lst:
+            member_ids = [c.id for c in lst.contacts]
+            query = query.filter(EmailDraft.contact_id.in_(member_ids))
+    drafts = query.all()
+    approved = 0
+    for d in drafts:
+        if d.lint_report and d.lint_report.get("ok"):
+            d.status = DraftStatus.APPROVED
+            d.approved_by_id = user.id
+            d.approved_at = utcnow()
+            approved += 1
+    db.commit()
+    return {"ok": True, "approved": approved}
+
+
 # ---------- replies ----------
 
 class ReplyIn(BaseModel):
@@ -719,13 +746,13 @@ def stats(db: Session = Depends(get_db)):
 def _verified_contacts_without_drafts(
     db: Session, limit: int, list_id: int | None = None,
 ) -> list[Contact]:
-    """VERIFIED contacts with no touch-1 draft yet; optionally scoped to one list."""
+    """Contacts with valid email addresses eligible for draft generation, optionally scoped to one list."""
     from app.models import ContactStatus as CS
 
-    drafted_ids = db.query(EmailDraft.contact_id).filter(EmailDraft.touch_number == 1)
     query = db.query(Contact).filter(
-        Contact.status == CS.VERIFIED,
-        ~Contact.id.in_(drafted_ids),
+        Contact.email.isnot(None),
+        Contact.email != "",
+        Contact.status.in_([CS.VERIFIED, CS.CONTACTED, CS.DISCOVERED, CS.NEEDS_MANUAL_REVIEW]),
     )
     if list_id is not None:
         lst = db.get(ContactList, list_id)
@@ -735,7 +762,12 @@ def _verified_contacts_without_drafts(
         if not member_ids:
             return []
         query = query.filter(Contact.id.in_(member_ids))
-    return query.limit(min(limit, 200)).all()
+    contacts = query.limit(min(limit, 200)).all()
+    for c in contacts:
+        if c.status in (CS.DISCOVERED, CS.NEEDS_MANUAL_REVIEW):
+            c.status = CS.VERIFIED
+    db.commit()
+    return contacts
 
 
 def _generate_drafts_for_contacts(
@@ -746,18 +778,24 @@ def _generate_drafts_for_contacts(
     drafted = 0
     lint_passed = 0
     lint_failed = 0
+    errors: list[str] = []
     llm = _llm()
     for contact in contacts:
         try:
-            draft = generate_draft(db, contact, llm, template_context=template_context)
+            draft = generate_draft(db, contact, llm, template_context=template_context, force_regenerate=True)
             drafted += 1
             if draft.lint_report and draft.lint_report.get("ok"):
                 lint_passed += 1
             else:
                 lint_failed += 1
-        except Exception:
+        except Exception as exc:
+            db.rollback()
             lint_failed += 1
-    return {"drafted": drafted, "lint_passed": lint_passed, "lint_failed": lint_failed}
+            errors.append(f"contact {contact.id} ({contact.full_name}): {exc}")
+    result: dict = {"drafted": drafted, "lint_passed": lint_passed, "lint_failed": lint_failed}
+    if errors:
+        result["errors"] = errors
+    return result
 
 
 def _resolve_template_context(db: Session, template_id: int | None) -> str | None:
@@ -769,9 +807,7 @@ def _resolve_template_context(db: Session, template_id: int | None) -> str | Non
     if not template:
         raise HTTPException(404, "Template not found")
     block = build_template_prompt_block(template)
-    if not block:
-        raise HTTPException(422, "Template has no additional context or formatting notes")
-    return block
+    return block or None
 
 
 @router.post("/pipeline/draft-emails")
@@ -909,6 +945,10 @@ def _campaign_dict(c: Campaign) -> dict:
     }
 
 
+class SendRequest(BaseModel):
+    contact_ids: list[int] | None = None
+
+
 def _run_send_with_campaign(
     db: Session,
     provider,
@@ -937,6 +977,37 @@ def _run_send_with_campaign(
     db.add(campaign)
     db.flush()
 
+    # Clone list-level campaign attachments to campaign-level attachments
+    import shutil
+    import uuid
+    from app.sender.storage import _storage_root
+
+    list_attachments = []
+    if list_id is not None:
+        list_attachments = db.query(Attachment).filter_by(list_id=list_id, campaign_id=None, draft_id=None).all()
+
+    for att in list_attachments:
+        ext = att.filename.split(".")[-1]
+        new_stored_name = f"{uuid.uuid4().hex}.{ext}"
+        src_path = _storage_root() / att.storage_path
+        dst_path = _storage_root() / new_stored_name
+        try:
+            shutil.copy2(src_path, dst_path)
+            clone = Attachment(
+                campaign_id=campaign.id,
+                list_id=None,
+                draft_id=None,
+                filename=new_stored_name,
+                original_filename=att.original_filename,
+                mime_type=att.mime_type,
+                size=att.size,
+                storage_path=new_stored_name,
+            )
+            db.add(clone)
+        except Exception:
+            pass
+    db.flush()
+
     quota = remaining_quota(db)
     result = send_approved_batch(
         db, provider,
@@ -944,6 +1015,7 @@ def _run_send_with_campaign(
         contact_ids=contact_ids,
         from_name=from_name,
         from_email=from_email,
+        campaign_id=campaign.id,
     )
 
     campaign.sent = result.get("sent", 0)
@@ -986,7 +1058,7 @@ def pipeline_send(limit: int = 25, sender_profile_id: int | None = None,
 
 
 @router.post("/lists/{list_id}/send")
-def send_for_list(list_id: int, limit: int = 25, dry_run: bool = False,
+def send_for_list(list_id: int, body: SendRequest | None = None, limit: int = 25, dry_run: bool = False,
                   sender_profile_id: int | None = None,
                   user: User = Depends(require_operator),
                   db: Session = Depends(get_db)):
@@ -996,7 +1068,12 @@ def send_for_list(list_id: int, limit: int = 25, dry_run: bool = False,
     lst = db.get(ContactList, list_id)
     if not lst:
         raise HTTPException(404, "List not found")
-    contact_ids = [c.id for c in lst.contacts]
+    
+    # Get contacts, optionally filtered by user selection
+    if body and body.contact_ids is not None:
+        contact_ids = [c.id for c in lst.contacts if c.id in body.contact_ids]
+    else:
+        contact_ids = [c.id for c in lst.contacts]
 
     if dry_run:
         ready = 0
@@ -1336,15 +1413,52 @@ def get_list(list_id: int, db: Session = Depends(get_db)):
     lst = db.get(ContactList, list_id)
     if not lst:
         raise HTTPException(404, "List not found")
+
+    # Fetch the latest draft status per contact in one query
+    contact_ids = [c.id for c in lst.contacts]
+    draft_status_map: dict[int, str] = {}
+    if contact_ids:
+        from app.models import EmailDraft
+        from sqlalchemy import desc
+        for cid in contact_ids:
+            latest = (
+                db.query(EmailDraft)
+                .filter(EmailDraft.contact_id == cid)
+                .order_by(desc(EmailDraft.id))
+                .first()
+            )
+            if latest:
+                draft_status_map[cid] = latest.status.value
+
+    # Research status per college
+    from app.models import ResearchSummary
+    college_ids = list({c.college_id for c in lst.contacts})
+    research_map: dict[int, str] = {}
+    if college_ids:
+        for rs in db.query(ResearchSummary).filter(
+            ResearchSummary.college_id.in_(college_ids)
+        ).all():
+            research_map[rs.college_id] = rs.status.value
+
     return {
         "id": lst.id, "name": lst.name, "description": lst.description,
         "contact_count": len(lst.contacts),
         "created_at": lst.created_at, "updated_at": lst.updated_at,
         "contacts": [
             {
-                "id": c.id, "full_name": c.full_name, "role": c.role.value,
-                "college": c.college.name, "email": c.email,
-                "confidence": c.confidence, "status": c.status.value,
+                "id": c.id,
+                "full_name": c.full_name,
+                "role": c.role.value,
+                "college": c.college.name,
+                "college_id": c.college_id,
+                "email": c.email,
+                "designation": c.designation_raw,
+                "confidence": c.confidence,
+                "status": c.status.value,
+                "research_status": research_map.get(c.college_id, "PENDING"),
+                "draft_status": draft_status_map.get(c.id),
+                "last_contact_at": c.last_contact_at,
+                "created_at": c.created_at,
             }
             for c in lst.contacts
         ],
@@ -1398,6 +1512,30 @@ def add_contact_to_list(list_id: int, contact_id: int,
     return {"ok": True, "contact_count": len(lst.contacts)}
 
 
+# ---------- list bulk operations ----------
+
+class BulkContactIds(BaseModel):
+    contact_ids: list[int]
+    target_list_id: int | None = None  # for move/copy
+
+
+@router.post("/lists/{list_id}/contacts/add-existing", status_code=201)
+def add_existing_contacts_to_list(list_id: int, body: BulkContactIds,
+                                  user: User = Depends(require_operator),
+                                  db: Session = Depends(get_db)):
+    lst = db.get(ContactList, list_id)
+    if not lst:
+        raise HTTPException(404, "List not found")
+    added = 0
+    for cid in body.contact_ids:
+        contact = db.get(Contact, cid)
+        if contact and contact not in lst.contacts:
+            lst.contacts.append(contact)
+            added += 1
+    db.commit()
+    return {"ok": True, "added": added, "contact_count": len(lst.contacts)}
+
+
 @router.delete("/lists/{list_id}/contacts/{contact_id}")
 def remove_contact_from_list(list_id: int, contact_id: int,
                               user: User = Depends(require_operator),
@@ -1412,3 +1550,362 @@ def remove_contact_from_list(list_id: int, contact_id: int,
         lst.contacts.remove(contact)
         db.commit()
     return {"ok": True, "contact_count": len(lst.contacts)}
+
+
+@router.post("/lists/{list_id}/contacts/bulk-remove")
+def bulk_remove_contacts_from_list(
+    list_id: int,
+    body: BulkContactIds,
+    user: User = Depends(require_operator),
+    db: Session = Depends(get_db),
+):
+    """Remove multiple contacts from a list (does not delete the contacts)."""
+    lst = db.get(ContactList, list_id)
+    if not lst:
+        raise HTTPException(404, "List not found")
+    removed = 0
+    for cid in body.contact_ids:
+        contact = db.get(Contact, cid)
+        if contact and contact in lst.contacts:
+            lst.contacts.remove(contact)
+            removed += 1
+    db.commit()
+    return {"ok": True, "removed": removed, "contact_count": len(lst.contacts)}
+
+
+@router.post("/lists/{list_id}/contacts/bulk-move")
+def bulk_move_contacts(
+    list_id: int,
+    body: BulkContactIds,
+    user: User = Depends(require_operator),
+    db: Session = Depends(get_db),
+):
+    """Move contacts from this list to another list."""
+    if not body.target_list_id:
+        raise HTTPException(422, "target_list_id is required")
+    src = db.get(ContactList, list_id)
+    dst = db.get(ContactList, body.target_list_id)
+    if not src:
+        raise HTTPException(404, "Source list not found")
+    if not dst:
+        raise HTTPException(404, "Target list not found")
+    moved = 0
+    for cid in body.contact_ids:
+        contact = db.get(Contact, cid)
+        if contact and contact in src.contacts:
+            src.contacts.remove(contact)
+            if contact not in dst.contacts:
+                dst.contacts.append(contact)
+            moved += 1
+    db.commit()
+    return {"ok": True, "moved": moved}
+
+
+@router.post("/lists/{list_id}/contacts/bulk-copy")
+def bulk_copy_contacts(
+    list_id: int,
+    body: BulkContactIds,
+    user: User = Depends(require_operator),
+    db: Session = Depends(get_db),
+):
+    """Copy contacts from this list to another list (keeps them in source too)."""
+    if not body.target_list_id:
+        raise HTTPException(422, "target_list_id is required")
+    dst = db.get(ContactList, body.target_list_id)
+    if not dst:
+        raise HTTPException(404, "Target list not found")
+    copied = 0
+    for cid in body.contact_ids:
+        contact = db.get(Contact, cid)
+        if contact and contact not in dst.contacts:
+            dst.contacts.append(contact)
+            copied += 1
+    db.commit()
+    return {"ok": True, "copied": copied}
+
+
+@router.get("/lists/{list_id}/export-csv")
+def export_list_csv(list_id: int, db: Session = Depends(get_db)):
+    """Export all contacts in a list as a CSV file."""
+    import io, csv
+    from fastapi.responses import StreamingResponse
+    lst = db.get(ContactList, list_id)
+    if not lst:
+        raise HTTPException(404, "List not found")
+
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=[
+        "id", "full_name", "role", "designation", "college", "email",
+        "status", "confidence", "last_contact_at", "created_at",
+    ])
+    writer.writeheader()
+    for c in lst.contacts:
+        writer.writerow({
+            "id": c.id,
+            "full_name": c.full_name,
+            "role": c.role.value,
+            "designation": c.designation_raw or "",
+            "college": c.college.name,
+            "email": c.email or "",
+            "status": c.status.value,
+            "confidence": c.confidence,
+            "last_contact_at": c.last_contact_at.isoformat() if c.last_contact_at else "",
+            "created_at": c.created_at.isoformat() if hasattr(c, 'created_at') and c.created_at else "",
+        })
+
+    filename = lst.name.replace(" ", "_").lower() + "_contacts.csv"
+    return StreamingResponse(
+        io.BytesIO(output.getvalue().encode("utf-8")),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ---------- campaign attachments ----------
+
+def _campaign_attachment_dict(att: Attachment) -> dict:
+    return {
+        "id": att.id,
+        "filename": att.original_filename,
+        "original_filename": att.original_filename,
+        "mime_type": att.mime_type,
+        "size": att.size,
+        "uploaded_at": att.uploaded_at,
+    }
+
+
+@router.get("/campaigns/{campaign_id}/attachments")
+def list_campaign_attachments(campaign_id: int, db: Session = Depends(get_db)):
+    campaign = db.get(Campaign, campaign_id)
+    if not campaign:
+        raise HTTPException(404, "Campaign not found")
+    rows = db.query(Attachment).filter_by(campaign_id=campaign_id).order_by(Attachment.id).all()
+    return {"items": [_campaign_attachment_dict(a) for a in rows]}
+
+
+@router.post("/campaigns/{campaign_id}/attachments", status_code=201)
+async def upload_campaign_attachments(
+    campaign_id: int,
+    files: list[UploadFile] = File(...),
+    user: User = Depends(require_operator),
+    db: Session = Depends(get_db),
+):
+    from app.sender.storage import delete_file, read_upload, save_bytes
+
+    campaign = db.get(Campaign, campaign_id)
+    if not campaign:
+        raise HTTPException(404, "Campaign not found")
+    if not files:
+        raise HTTPException(422, "No files uploaded")
+    max_per = get_settings().max_attachments_per_draft
+    existing = db.query(Attachment).filter_by(campaign_id=campaign_id).count()
+    if existing + len(files) > max_per:
+        raise HTTPException(422, f"Maximum {max_per} attachments per campaign")
+
+    created: list[dict] = []
+    saved_paths: list[str] = []
+    try:
+        for upload in files:
+            content, original, stored_name, mime_type = await read_upload(upload)
+            storage_path = save_bytes(content, stored_name)
+            saved_paths.append(storage_path)
+            row = Attachment(
+                campaign_id=campaign_id,
+                draft_id=None,
+                filename=stored_name,
+                original_filename=original,
+                mime_type=mime_type,
+                size=len(content),
+                storage_path=storage_path,
+            )
+            db.add(row)
+            db.flush()
+            created.append(_campaign_attachment_dict(row))
+        db.commit()
+    except Exception:
+        db.rollback()
+        for path in saved_paths:
+            delete_file(path)
+        raise
+    return {"items": created}
+
+
+@router.delete("/campaigns/{campaign_id}/attachments/{attachment_id}")
+def delete_campaign_attachment(
+    campaign_id: int,
+    attachment_id: int,
+    user: User = Depends(require_operator),
+    db: Session = Depends(get_db),
+):
+    from app.sender.storage import delete_file
+
+    campaign = db.get(Campaign, campaign_id)
+    if not campaign:
+        raise HTTPException(404, "Campaign not found")
+    att = db.get(Attachment, attachment_id)
+    if not att or att.campaign_id != campaign_id:
+        raise HTTPException(404, "Attachment not found")
+    delete_file(att.storage_path)
+    db.delete(att)
+    db.commit()
+    return {"ok": True}
+
+
+@router.put("/campaigns/{campaign_id}/attachments/{attachment_id}")
+async def replace_campaign_attachment(
+    campaign_id: int,
+    attachment_id: int,
+    file: UploadFile = File(...),
+    user: User = Depends(require_operator),
+    db: Session = Depends(get_db),
+):
+    from app.sender.storage import delete_file, read_upload, save_bytes
+
+    campaign = db.get(Campaign, campaign_id)
+    if not campaign:
+        raise HTTPException(404, "Campaign not found")
+    att = db.get(Attachment, attachment_id)
+    if not att or att.campaign_id != campaign_id:
+        raise HTTPException(404, "Attachment not found")
+
+    content, original, stored_name, mime_type = await read_upload(file)
+    old_path = att.storage_path
+    att.filename = stored_name
+    att.original_filename = original
+    att.mime_type = mime_type
+    att.size = len(content)
+    att.storage_path = save_bytes(content, stored_name)
+    db.commit()
+    delete_file(old_path)
+    return _campaign_attachment_dict(att)
+
+
+# ---------- list-level campaign attachments ----------
+
+@router.get("/lists/{list_id}/attachments")
+def list_list_attachments(list_id: int, db: Session = Depends(get_db)):
+    lst = db.get(ContactList, list_id)
+    if not lst:
+        raise HTTPException(404, "List not found")
+    rows = db.query(Attachment).filter_by(list_id=list_id, campaign_id=None, draft_id=None).order_by(Attachment.id).all()
+    return {"items": [_campaign_attachment_dict(a) for a in rows]}
+
+
+@router.post("/lists/{list_id}/attachments", status_code=201)
+async def upload_list_attachments(
+    list_id: int,
+    files: list[UploadFile] = File(...),
+    user: User = Depends(require_operator),
+    db: Session = Depends(get_db),
+):
+    from app.sender.storage import delete_file, read_upload, save_bytes
+
+    lst = db.get(ContactList, list_id)
+    if not lst:
+        raise HTTPException(404, "List not found")
+    if not files:
+        raise HTTPException(422, "No files uploaded")
+    max_per = get_settings().max_attachments_per_draft
+    existing = db.query(Attachment).filter_by(list_id=list_id, campaign_id=None, draft_id=None).count()
+    if existing + len(files) > max_per:
+        raise HTTPException(422, f"Maximum {max_per} attachments per list")
+
+    created: list[dict] = []
+    saved_paths: list[str] = []
+    try:
+        for upload in files:
+            content, original, stored_name, mime_type = await read_upload(upload)
+            storage_path = save_bytes(content, stored_name)
+            saved_paths.append(storage_path)
+            row = Attachment(
+                list_id=list_id,
+                draft_id=None,
+                campaign_id=None,
+                filename=stored_name,
+                original_filename=original,
+                mime_type=mime_type,
+                size=len(content),
+                storage_path=storage_path,
+            )
+            db.add(row)
+            db.flush()
+            created.append(_campaign_attachment_dict(row))
+        db.commit()
+    except Exception:
+        db.rollback()
+        for path in saved_paths:
+            delete_file(path)
+        raise
+    return {"items": created}
+
+
+@router.delete("/lists/{list_id}/attachments/{attachment_id}")
+def delete_list_attachment(
+    list_id: int,
+    attachment_id: int,
+    user: User = Depends(require_operator),
+    db: Session = Depends(get_db),
+):
+    from app.sender.storage import delete_file
+
+    lst = db.get(ContactList, list_id)
+    if not lst:
+        raise HTTPException(404, "List not found")
+    att = db.get(Attachment, attachment_id)
+    if not att or att.list_id != list_id or att.campaign_id is not None or att.draft_id is not None:
+        raise HTTPException(404, "Attachment not found")
+    delete_file(att.storage_path)
+    db.delete(att)
+    db.commit()
+    return {"ok": True}
+
+
+@router.put("/lists/{list_id}/attachments/{attachment_id}")
+async def replace_list_attachment(
+    list_id: int,
+    attachment_id: int,
+    file: UploadFile = File(...),
+    user: User = Depends(require_operator),
+    db: Session = Depends(get_db),
+):
+    from app.sender.storage import delete_file, read_upload, save_bytes
+
+    lst = db.get(ContactList, list_id)
+    if not lst:
+        raise HTTPException(404, "List not found")
+    att = db.get(Attachment, attachment_id)
+    if not att or att.list_id != list_id or att.campaign_id is not None or att.draft_id is not None:
+        raise HTTPException(404, "Attachment not found")
+
+    content, original, stored_name, mime_type = await read_upload(file)
+    old_path = att.storage_path
+    att.filename = stored_name
+    att.original_filename = original
+    att.mime_type = mime_type
+    att.size = len(content)
+    att.storage_path = save_bytes(content, stored_name)
+    db.commit()
+    delete_file(old_path)
+    return _campaign_attachment_dict(att)
+
+
+# ---------- attachment download / preview ----------
+
+@router.get("/attachments/{attachment_id}/file")
+def get_attachment_file(attachment_id: int, download: bool = False, db: Session = Depends(get_db)):
+    from app.sender.storage import read_bytes
+    from fastapi.responses import Response
+    att = db.get(Attachment, attachment_id)
+    if not att:
+        raise HTTPException(404, "Attachment not found")
+    content = read_bytes(att.storage_path)
+    headers = {}
+    if download:
+        headers["Content-Disposition"] = f'attachment; filename="{att.original_filename}"'
+    else:
+        headers["Content-Disposition"] = f'inline; filename="{att.original_filename}"'
+    return Response(
+        content=content,
+        media_type=att.mime_type,
+        headers=headers,
+    )

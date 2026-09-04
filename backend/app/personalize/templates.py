@@ -8,18 +8,27 @@ def build_template_prompt_block(template: EmailTemplate | None) -> str:
     if template is None:
         return ""
     parts: list[str] = []
+    if template.name and template.name.strip():
+        parts.append(
+            f"TEMPLATE NAME: {template.name.strip()}"
+        )
+    if template.description and template.description.strip():
+        parts.append(
+            f"TEMPLATE OBJECTIVE: {template.description.strip()}"
+        )
     if template.additional_context and template.additional_context.strip():
         parts.append(
-            "ADDITIONAL CONTEXT (use only when consistent with the fact sheet above):\n"
+            "EMAIL TEMPLATE CONTENT / INSTRUCTIONS:\n"
+            "You MUST base the email message, offer, key points, structure, and details on this template:\n"
             + template.additional_context.strip()
         )
     if template.formatting_notes and template.formatting_notes.strip():
         parts.append(
-            "FORMATTING GUIDANCE:\n" + template.formatting_notes.strip()
+            "FORMATTING & TONE GUIDANCE:\n" + template.formatting_notes.strip()
         )
     if not parts:
         return ""
-    return "\n\n" + "\n\n".join(parts)
+    return "\n\n=== SELECTED EMAIL TEMPLATE ===\n" + "\n\n".join(parts) + "\n================================\n"
 
 
 def preview_template_prompt(

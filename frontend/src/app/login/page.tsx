@@ -82,6 +82,7 @@ export default function LoginPage() {
                   type="email"
                   required
                   autoFocus
+                  suppressHydrationWarning
                   placeholder="admin@aivalytics.com"
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}

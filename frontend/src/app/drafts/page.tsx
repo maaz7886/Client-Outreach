@@ -27,16 +27,22 @@ function formatFileSize(bytes: number): string {
 
 export default function DraftsPage() {
   const [drafts, setDrafts] = useState<Draft[]>([]);
+  const [statusFilter, setStatusFilter] = useState<string>("draft");
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
 
   const load = useCallback(() => {
-    api<{ items: Draft[] }>("/api/drafts?status=draft&limit=50")
-      .then((d) => setDrafts(d.items))
+    api<{ items: Draft[] }>(`/api/drafts?status=${statusFilter}&limit=100`)
+      .then((d) => { setDrafts(d.items); setError(null); })
       .catch((e) => setError(String(e)));
-  }, []);
+  }, [statusFilter]);
 
-  useEffect(load, [load]);
+  useEffect(() => {
+    load();
+    window.addEventListener("focus", load);
+    return () => window.removeEventListener("focus", load);
+  }, [load]);
 
   async function act(id: number, action: "approve" | "reject") {
     setError(null);
@@ -46,6 +52,18 @@ export default function DraftsPage() {
       setTimeout(() => setNotice(null), 3000);
       load();
     } catch (e) { setError(String(e)); }
+  }
+
+  async function approveAll() {
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await api<{ approved: number }>("/api/drafts/approve-all", { method: "POST" });
+      setNotice(`Approved ${res.approved} pending draft(s)`);
+      setTimeout(() => setNotice(null), 3000);
+      load();
+    } catch (e) { setError(String(e)); }
+    finally { setBusy(false); }
   }
 
   async function saveEdit(draft: Draft, body: string, subject: string) {
@@ -64,23 +82,65 @@ export default function DraftsPage() {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
       {/* Header */}
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
         <div>
           <h1 style={{ fontSize: 22, fontWeight: 800, color: "#0f3622", margin: 0 }}>
             Approval Queue
             <span style={{ fontSize: 14, fontWeight: 400, color: "#6b9e7e", marginLeft: 8 }}>
-              {drafts.length} pending
+              {drafts.length} {statusFilter}
             </span>
           </h1>
           <p style={{ color: "#6b9e7e", fontSize: 13, marginTop: 2 }}>Review, edit, and approve email drafts before sending</p>
         </div>
-        <div style={{
-          background: drafts.length > 0 ? "#fef9c3" : "#e8f5ee",
-          color: drafts.length > 0 ? "#92400e" : "#1a5c38",
-          borderRadius: 8, padding: "6px 14px", fontSize: 12, fontWeight: 700
-        }}>
-          {drafts.length > 0 ? `⚠ ${drafts.length} awaiting review` : "✓ Queue empty"}
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          {statusFilter === "draft" && drafts.length > 0 && (
+            <button
+              onClick={approveAll}
+              disabled={busy}
+              style={{
+                background: "#10b981", color: "#fff", border: "none",
+                borderRadius: 8, padding: "7px 16px", fontSize: 12, fontWeight: 800,
+                cursor: busy ? "not-allowed" : "pointer", boxShadow: "0 2px 8px rgba(16,185,129,0.25)"
+              }}
+            >
+              {busy ? "⟳ Approving…" : "✓ Approve All Passing"}
+            </button>
+          )}
+          <button
+            onClick={load}
+            title="Refresh queue"
+            style={{
+              background: "#f0f7f3", color: "#1a5c38", border: "1px solid #cce0d4",
+              borderRadius: 8, padding: "6px 12px", fontSize: 12, fontWeight: 700,
+              cursor: "pointer",
+            }}
+          >
+            ↻ Refresh
+          </button>
         </div>
+      </div>
+
+      {/* Filter Tabs */}
+      <div style={{ display: "flex", gap: 8, borderBottom: "1px solid #dceae2", paddingBottom: 10 }}>
+        {[
+          { key: "draft", label: "Pending Review" },
+          { key: "approved", label: "Approved" },
+          { key: "rejected", label: "Rejected" },
+          { key: "sent", label: "Sent" },
+        ].map((tab) => (
+          <button
+            key={tab.key}
+            onClick={() => setStatusFilter(tab.key)}
+            style={{
+              background: statusFilter === tab.key ? "#0f3622" : "#f0f7f3",
+              color: statusFilter === tab.key ? "#fff" : "#3d6b4f",
+              border: "none", borderRadius: 6, padding: "6px 14px",
+              fontSize: 12, fontWeight: 700, cursor: "pointer"
+            }}
+          >
+            {tab.label}
+          </button>
+        ))}
       </div>
 
       {error && (
